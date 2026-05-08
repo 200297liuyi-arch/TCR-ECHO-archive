@@ -1,0 +1,7 @@
+__pycache__/
+datasets/
+runs/
+wandb/
+esm/
+*.pth
+*.xlsx
