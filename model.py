@@ -42,6 +42,7 @@ class Model(nn.Module):
         # ── Structure-aware training ───────────────────────────────
         use_structure: bool = False,
         contact_threshold: float = 5.0,
+        fusion_gcn: bool = True,  # kept for checkpoint compatibility
     ):
         super().__init__()
 
@@ -356,16 +357,13 @@ class Model(nn.Module):
                 threshold=self.contact_threshold,
             )
             labels = labels.to(interaction_map.device)
-            intermap_logits = interaction_map.view(-1, 2)  # adapt as needed
-            # For binary contact prediction, reshape interaction_map
-            # interaction_map: [B, k, k, H] — use H-dim projection
             criterion = WeightedFocalLoss(alpha=0.7, gamma=2, reduction='sum')
-            # Flatten to per-pair predictions
+            # interaction_map: [B, k, k, H] — average over hidden dim, produce 2-class logits
             B, K = interaction_map.shape[0], interaction_map.shape[1]
             flat_map = interaction_map.view(B * K * K, -1)
-            # Simple: average over hidden dim as logit
-            pair_logits = flat_map.mean(dim=-1)
-            return criterion(pair_logits, labels.float().view(-1))
+            pair_logits = flat_map.mean(dim=-1).view(-1, 1)   # [B*K*K, 1]
+            pair_logits = torch.cat([-pair_logits, pair_logits], dim=-1)  # [B*K*K, 2]
+            return criterion(pair_logits, labels.view(-1))
 
         return None
 

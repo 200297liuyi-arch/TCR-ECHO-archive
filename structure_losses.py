@@ -33,9 +33,9 @@ class NegativePearsonCorrelationLossWithMask(nn.Module):
         -------
         loss : scalar  (1 + correlation), minimized at correlation = -1
         """
-        A_flat = A.view(-1)
-        B_flat = B.view(-1)
-        mask_flat = mask.view(-1)
+        A_flat = A.reshape(-1)
+        B_flat = B.reshape(-1)
+        mask_flat = mask.reshape(-1)
 
         A_masked = A_flat[mask_flat != 0]
         B_masked = B_flat[mask_flat != 0]

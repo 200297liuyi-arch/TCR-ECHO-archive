@@ -61,7 +61,7 @@ def adjust_learning_rate(lr, epochs, epoch, cosine=True, lr_decay_rate=0.5):
         return lr
 
 
-def finetune_stage1(model, train_loader, device, args):
+def finetune_stage1(model, train_loader, optimizer, device, args):
     """Stage 1: Fine-tune TopK layers with Pearson correlation loss.
 
     Freezes ESM2 encoders + TGCN layers.
@@ -116,25 +116,24 @@ def finetune_stage1(model, train_loader, device, args):
         loss = pearson_criterion(joint_scores, distances, mask)
         losses.update(loss.item(), len(dist_mats))
 
-        optimizer = model.optimizer if hasattr(model, 'optimizer') else None
-        if optimizer is not None:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
     return losses.avg
 
 
-def finetune_stage2(model, train_loader, device, args):
-    """Stage 2: Fine-tune classifier + cross-attention with contact focal loss.
+def finetune_stage2(model, train_loader, optimizer, device, args):
+    """Stage 2: Fine-tune classifier + spatial projection with contact focal loss.
 
-    Freezes encoder + TopK layers.
-    Only cross-attention + projector + classifier are trainable.
+    Freezes encoder + TopK layers. Interaction map comes from frozen GCN,
+    then flows through trainable gcn_spatial_proj for gradient propagation.
 
     Parameters
     ----------
     model : Model
     train_loader : DataLoader
+    optimizer : torch.optim.Optimizer
     device : torch.device
     args : dict
 
@@ -154,6 +153,9 @@ def finetune_stage2(model, train_loader, device, args):
     losses = AverageMeter()
     k = args['k']
 
+    # Use the first Linear in gcn_spatial_proj as trainable contact head
+    contact_proj = model.gcn_spatial_proj[0]  # nn.Linear(H_gcn, H_esm)
+
     for _, pep_chems, pep_graphs, tcr_chems, tcr_graphs, dist_mats in train_loader:
         pep_batch = Batch.from_data_list(pep_graphs).to(device)
         tcr_batch = Batch.from_data_list(tcr_graphs).to(device)
@@ -162,23 +164,27 @@ def finetune_stage2(model, train_loader, device, args):
 
         p_perm = gcn_out["p_perm"]
         c_perm = gcn_out["c_perm"]
-        interaction_map = gcn_out["interaction_map"]
+        interaction_map = gcn_out["interaction_map"]    # [B, k, k, H_gcn]
 
         # Generate contact labels from distance matrices
         labels = generate_contact_labels(dist_mats, p_perm, c_perm, k,
                                          threshold=args.get('contact_threshold', 5.0))
         labels = labels.to(device)
 
-        # Reshape interaction_map [B, k, k, H] → [B*k*k, H] for classification
+        # Route through trainable contact_proj so gradients flow
         B, K, _, H = interaction_map.shape
-        flat_map = interaction_map.view(B * K * K, H)
-        # Average over hidden dim as a simple logit per pair
-        pair_logits = flat_map.mean(dim=-1).view(-1, 1)   # [B*K*K, 1]
-        pair_logits = torch.cat([-pair_logits, pair_logits], dim=-1)  # [B*K*K, 2]
+        flat_map = interaction_map.view(B * K * K, H)               # [B*K*K, H_gcn]
+        pair_features = contact_proj(flat_map)                      # [B*K*K, H_esm]
+        pair_scores = pair_features.mean(dim=-1).view(-1, 1)         # [B*K*K, 1]
+        pair_logits = torch.cat([-pair_scores, pair_scores], dim=-1) # [B*K*K, 2]
         flat_labels = labels.view(-1)
 
         loss = classify_criterion(pair_logits, flat_labels)
         losses.update(loss.item() / len(dist_mats), len(dist_mats))
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
     return losses.avg
 
@@ -241,7 +247,7 @@ def train_structure_pipeline(model, device, args):
             for pg in stage1_opt.param_groups:
                 pg['lr'] = lr_epoch
 
-            loss_val = finetune_stage1(model, train_loader, device, args)
+            loss_val = finetune_stage1(model, train_loader, stage1_opt, device, args)
             if epoch % 20 == 0 or epoch == args['stage1_epochs'] - 1:
                 print(f"  Stage1 Epoch {epoch}: Loss={loss_val:.4f}")
 
@@ -253,8 +259,14 @@ def train_structure_pipeline(model, device, args):
         )
 
         model.set_stage(2)
+        # Stage 2: GCN is frozen, train classifier + spatial projection + cross-attention
+        stage2_trainable = (
+            list(model.gcn_spatial_proj.parameters())
+            + list(model.classifier.parameters())
+            + list(model.cross_attn.parameters())
+        )
         stage2_opt = optim.Adam(
-            filter(lambda p: p.requires_grad, model.gcn.parameters()),
+            stage2_trainable,
             lr=args['lr'],
             weight_decay=args.get('weight_decay', 1e-4),
         )
@@ -268,7 +280,7 @@ def train_structure_pipeline(model, device, args):
             for pg in stage2_opt.param_groups:
                 pg['lr'] = lr_epoch
 
-            loss_val = finetune_stage2(model, train_loader, device, args)
+            loss_val = finetune_stage2(model, train_loader, stage2_opt, device, args)
             if loss_val < min_loss:
                 min_loss = loss_val
                 save_dir = args.get('save_dir', 'runs/structure/')
