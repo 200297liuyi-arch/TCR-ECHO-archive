@@ -2,159 +2,139 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-class BalancedAtchleyAttention(nn.Module):
-    def __init__(
-        self, 
-        dim, 
-        num_heads, 
-        dropout=0.1, 
-        enable_monitoring=False
-    ):
+
+
+class BidirectionalDualViewAttention(nn.Module):
+    """Bi-directional Dual-View Cross-Attention (Phase 2).
+
+    Shared learnable parameters across both directions:
+      - U [H,5,5]  — biophysical compatibility bilinear form
+      - mix_param   — blend ratio between sequence & physicochemical views
+
+    Direction 1 (TCR → Peptide):
+      S_seq = Q_tcr @ K_pep^T / √d
+      S_bio = A_tcr @ U @ A_pep^T
+
+    Direction 2 (Peptide → TCR):
+      S_seq = Q_pep @ K_tcr^T / √d
+      S_bio = A_pep @ U.T @ A_tcr^T   (transposed U for symmetry)
+
+    Fusion (shared ρ):
+      ρ = (tanh(mix_param) + 1) / 2   ∈ [0, 1]
+      combined = (1-ρ) * S_seq + ρ * S_bio
+    """
+
+    def __init__(self, dim, num_heads, dropout=0.1, enable_monitoring=False):
         super().__init__()
-        # Separate projections for q, k, v
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        
-        # Bilinear form for Atchley factors
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # QKV projections — separate per direction
+        self.q_proj_t = nn.Linear(dim, dim)  # TCR as query
+        self.k_proj_p = nn.Linear(dim, dim)  # Peptide as key
+        self.v_proj_p = nn.Linear(dim, dim)  # Peptide as value
+        self.q_proj_p = nn.Linear(dim, dim)  # Peptide as query
+        self.k_proj_t = nn.Linear(dim, dim)  # TCR as key
+        self.v_proj_t = nn.Linear(dim, dim)  # TCR as value
+
+        self.out_proj_t = nn.Linear(dim, dim)
+        self.out_proj_p = nn.Linear(dim, dim)
+
+        # ── shared across both directions ────────────────────────────
+        # bilinear form for biophysical compatibility
         self.U = nn.Parameter(torch.randn(num_heads, 5, 5) * 0.02)
-        
-        # Mix parameter
+
+        # shared mix parameter: blend sequence ↔ physicochemical views
         self.mix_param = nn.Parameter(torch.tensor(0.0))
-        
-        # Optional monitoring
+
+        self.dropout = nn.Dropout(dropout)
+
         self.enable_monitoring = enable_monitoring
         if enable_monitoring:
-            self.register_buffer("mix_param_history", torch.zeros(100))
+            self.register_buffer("rho_history", torch.zeros(100))
             self.history_idx = 0
-        
-        self.num_heads = num_heads
-        self.dim = dim
-        self.head_dim = dim // num_heads
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, seq1, seq2, atc1, atc2):
-        B, L1, _ = seq1.shape
-        _, L2, _ = seq2.shape
-        
-        # (dropping the padding tokens)
-        if atc1.size(1) > L1:
-            atc1 = atc1[:, :L1, :]
-            
-        if atc2.size(1) > L2:
-            atc2 = atc2[:, :L2, :]
-        
-        seq1 = seq1.to(self.q_proj.weight.dtype)
-        seq2 = seq2.to(self.q_proj.weight.dtype)
-        q = self.q_proj(seq1)
-        k = self.k_proj(seq2)
-        v = self.v_proj(seq2)
-        
-        # Reshape for multi-head attention
-        q = q.view(B, L1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L2, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L2, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Standard attention
-        std_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
-        # Compute biophysical bias for each head separately
-        bio_scores = torch.zeros_like(std_scores)
-        
+
+    def _forward_one_direction(self, q_seq, kv_seq, atc_q, atc_kv,
+                                q_proj, k_proj, v_proj, out_proj,
+                                transpose_U=False):
+        """Single cross-attention direction.
+
+        q_seq: query sequence embedding   [B, Lq, D]
+        kv_seq: key/value sequence embedding [B, Lkv, D]
+        atc_q: Atchley factors for query  [B, Lq, 5]
+        atc_kv: Atchley factors for key   [B, Lkv, 5]
+        transpose_U: if True, use U^T for reverse direction symmetry
+        """
+        B, Lq, _ = q_seq.shape
+        _, Lkv, _ = kv_seq.shape
+
+        if atc_q.size(1) > Lq:
+            atc_q = atc_q[:, :Lq, :]
+        if atc_kv.size(1) > Lkv:
+            atc_kv = atc_kv[:, :Lkv, :]
+
+        # QKV
+        q = q_proj(q_seq).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k_proj(kv_seq).view(B, Lkv, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v_proj(kv_seq).view(B, Lkv, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # View 1: sequence attention
+        S_seq = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B,H,Lq,Lkv]
+
+        # View 2: biophysical attention
+        S_bio = torch.zeros_like(S_seq)
+        U_eff = self.U.transpose(-1, -2) if transpose_U else self.U
         for h in range(self.num_heads):
-            # Extract bilinear form for this head
-            U_h = self.U[h]  # [5, 5]
-            
-            # Compute bias for this head
-            head_bias = torch.einsum("bip,pq,bjq->bij", atc1, U_h, atc2)
-            
-            # Add to the appropriate slice of bio_scores
-            bio_scores[:, h] = head_bias
-        
-        # Mix with bounded parameter
-        mix = torch.tanh(self.mix_param)
-        
-        # Update history if monitoring is enabled
+            U_h = U_eff[h]  # [5, 5]
+            head_bias = torch.einsum("bip,pq,bjq->bij", atc_q, U_h, atc_kv)
+            S_bio[:, h] = head_bias  # [B, Lq, Lkv]
+
+        # Fusion with shared ρ
+        rho = (torch.tanh(self.mix_param) + 1) / 2  # [0, 1]
+        combined = S_seq * (1 - rho) + S_bio * rho
+
         if self.enable_monitoring:
             with torch.no_grad():
-                self.mix_param_history[self.history_idx] = mix.item()
+                self.rho_history[self.history_idx] = rho.item()
                 self.history_idx = (self.history_idx + 1) % 100
-        
-        # Normalize each attention mechanism before mixing
-        std_scores_norm = F.softmax(std_scores, dim=-1)
-        bio_scores_norm = F.softmax(bio_scores, dim=-1)
-        
-        # Interpolate between attention mechanisms
-        mix_ratio = (mix + 1) / 2  # Convert from [-1,1] to [0,1]
-        attn = (1 - mix_ratio) * std_scores_norm + mix_ratio * bio_scores_norm
-        
-        # Apply dropout and compute weighted values
-        attn = self.dropout(attn)
-        out = attn @ v
-        
-        # Reshape and project to output dimension
-        out = out.transpose(1, 2).reshape(B, L1, self.dim)
-        return self.out_proj(out)
-        
-    def get_bias_strength(self):
-        """Return current bias strength for monitoring"""
-        return torch.tanh(self.mix_param).item()
-    
-    
-class StandardCrossAttention(nn.Module):
-    """
-    Standard cross-attention mechanism without Atchley factor integration.
-    Can serve as a baseline or be used in combination with other attention types.
-    """
-    def __init__(self, dim, num_heads, dropout=0.1, enable_monitoring=None):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        # Separate projections for queries, keys, and values
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, seq1, seq2, *args):
+
+        attn = self.dropout(F.softmax(combined, dim=-1))
+        out = attn @ v  # [B, H, Lq, Dh]
+        out = out.transpose(1, 2).reshape(B, Lq, self.dim)
+        return out_proj(out)
+
+    def forward(self, tcr_enc, pep_enc, atchley1, atchley2):
+        """Bi-directional cross-attention.
+
+        Parameters
+        ----------
+        tcr_enc : [B, L_tcr, D]
+        pep_enc : [B, L_pep, D]
+        atchley1 : [B, L_tcr, 5]
+        atchley2 : [B, L_pep, 5]
+
+        Returns
+        -------
+        tcr_att : [B, L_tcr, D]   TCR attended over Peptide
+        pep_att : [B, L_pep, D]   Peptide attended over TCR
         """
-        Args:
-            seq1: First sequence tensor [B, L1, D]
-            seq2: Second sequence tensor [B, L2, D]
-            *args: Additional arguments (ignored in this class)
-        
-        Returns:
-            output: Attention output [B, L1, D]
-        """
-        B, L1, _ = seq1.shape
-        _, L2, _ = seq2.shape
-        
-        # Project to queries, keys, values
-        q = self.q_proj(seq1)
-        k = self.k_proj(seq2)
-        v = self.v_proj(seq2)
-        
-        # Reshape for multi-head attention
-        q = q.view(B, L1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L2, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L2, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Compute attention scores
-        scores = (q @ k.transpose(-2, -1)) * self.scale
-        
-        # Apply softmax and dropout
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-        
-        # Apply attention to values
-        out = attn @ v
-        
-        # Reshape and project output
-        out = out.transpose(1, 2).reshape(B, L1, self.dim)
-        return self.out_proj(out)
+        # Direction 1: TCR → Peptide
+        tcr_att = self._forward_one_direction(
+            q_seq=tcr_enc, kv_seq=pep_enc,
+            atc_q=atchley1, atc_kv=atchley2,
+            q_proj=self.q_proj_t, k_proj=self.k_proj_p, v_proj=self.v_proj_p,
+            out_proj=self.out_proj_t,
+            transpose_U=False,
+        )
+
+        # Direction 2: Peptide → TCR  (U^T for symmetric scoring)
+        pep_att = self._forward_one_direction(
+            q_seq=pep_enc, kv_seq=tcr_enc,
+            atc_q=atchley2, atc_kv=atchley1,
+            q_proj=self.q_proj_p, k_proj=self.k_proj_t, v_proj=self.v_proj_t,
+            out_proj=self.out_proj_p,
+            transpose_U=True,
+        )
+
+        return tcr_att, pep_att
