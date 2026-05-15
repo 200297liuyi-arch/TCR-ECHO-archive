@@ -47,21 +47,27 @@ def train_one(cfg, epochs, run_name_suffix=""):
         cfg['dataset']['columns'],
         mask_prob=cfg['dataset'].get('mask_prob', 0.0),
         use_graph=use_graph,
+        graph_cache_dir=cfg.get('graph_cache_dir'),
     )
     val_ds = TCRPeptideDataset(
         df_val, tokenizer, atchley_map,
         cfg['dataset']['columns'],
         use_graph=use_graph,
+        graph_cache_dir=cfg.get('graph_cache_dir'),
     )
 
     collate_fn = collate_graph_batch if use_graph else None
     train_loader = DataLoader(
         train_ds, batch_size=cfg['training']['batch_size'],
         shuffle=True, collate_fn=collate_fn,
+        num_workers=8, pin_memory=True,
+        persistent_workers=True, prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg['training']['batch_size'],
         collate_fn=collate_fn,
+        num_workers=4, pin_memory=True,
+        persistent_workers=True, prefetch_factor=2,
     )
 
     # ── Model ───────────────────────────────────────────────────────
@@ -88,6 +94,8 @@ def train_one(cfg, epochs, run_name_suffix=""):
         'gcn_args':             gcn_args,
         'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
         'fusion_gcn':           cfg.get('fusion_gcn', True),
+        'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
+        'cross_attn_dropout':   cfg.get('cross_attn_dropout', 0.1),
     }
 
     model = Model(**model_params).to(cfg.get('device', 'cpu'))
@@ -97,6 +105,15 @@ def train_one(cfg, epochs, run_name_suffix=""):
         weight_decay=cfg['training']['weight_decay'],
     )
 
+    if len(train_loader) == 0:
+        raise RuntimeError(
+            f"Train loader has 0 batches ({len(train_ds)} samples loaded "
+            f"from {cfg['dataset']['train_csv']}). Check data file.")
+    if len(val_loader) == 0:
+        raise RuntimeError(
+            f"Val loader has 0 batches ({len(val_ds)} samples loaded "
+            f"from {cfg['dataset']['val_csv']}). Check data file.")
+
     best_auc = 0
     for epoch in range(epochs):
         # ── train ───────────────────────────────────────────────────
@@ -104,7 +121,7 @@ def train_one(cfg, epochs, run_name_suffix=""):
         losses = []
         for batch in train_loader:
             optimizer.zero_grad()
-            batch = [b.to(cfg.get('device', 'cpu')) if isinstance(b, torch.Tensor) else b
+            batch = [b.to(cfg.get('device', 'cpu'), non_blocking=True) if isinstance(b, torch.Tensor) else b
                      for b in batch]
             if use_graph:
                 (inp1, msk1, inp2, msk2, at1, at2, labels,
@@ -134,6 +151,18 @@ def train_one(cfg, epochs, run_name_suffix=""):
             **{f'val_{k}': v for k, v in val_metrics.items()},
             'epoch': epoch,
         })
+
+        now = __import__('datetime').datetime.now().strftime('%H:%M:%S')
+        metric_str = ' | '.join(f'{k}={v:.4f}' for k, v in val_metrics.items())
+        import subprocess, os
+        try:
+            smi = subprocess.run(['nvidia-smi','--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu','--format=csv,noheader'],
+                                 capture_output=True, text=True, timeout=5)
+            gpu = smi.stdout.strip().replace('\n', ' | ')
+        except:
+            gpu = 'N/A'
+        print(f'[{now}] Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | {metric_str} | PID={os.getpid()} | GPU: {gpu}',
+              flush=True)
 
         if val_metrics['auc'] > best_auc:
             best_auc = val_metrics['auc']
@@ -173,6 +202,7 @@ def main(config, structure_mode=False):
         df_test, tokenizer, atchley_map,
         run_cfg['dataset']['columns'],
         use_graph=use_graph,
+        graph_cache_dir=run_cfg.get('graph_cache_dir'),
     )
     collate_fn = collate_graph_batch if use_graph else None
     test_loader = DataLoader(
@@ -220,6 +250,7 @@ def _run_structure_training(cfg, device):
         'use_gcn': True,
         'gcn_args': gcn_args,
         'gcn_freeze_encoder': cfg.get('gcn_freeze_encoder', True),
+        'lambda_gcn_aux':   cfg.get('lambda_gcn_aux', 1.0),
         'use_structure': True,
         'contact_threshold': cfg.get('structure_training', {}).get(
             'contact_threshold', 5.0

@@ -1,4 +1,4 @@
-# ECHO-GCN: TCR-ECHO baseline + deepAntigen atom-graph spatial bias
+# ECHO-GCN: TCR-ECHO + deepAntigen atom-graph — Joint Pretraining
 device: cuda
 classifier_hidden: 512
 
@@ -11,11 +11,13 @@ dataset:
   mask_prob: 0.1
   columns:
     label: label
-    peptide: seq_2
-    tcr: seq_1
-  test_csv: test.csv
-  train_csv: train.csv
-  val_csv: val.csv
+    peptide: peptide
+    tcr: binding_TCR
+  test_csv: datasets/panpep/majority_testing_dataset.csv
+  train_csv: datasets/panpep/train_joint.csv
+  val_csv: datasets/panpep/val_joint.csv
+
+graph_cache_dir: datasets/panpep/graph_cache     # precomputed pickle cache
 
 esm:
   encoder1: esm2_t33_650M_UR50D
@@ -69,44 +71,46 @@ lora:
       task_type: FEATURE_EXTRACTION
 
 # ══════════════════════════════════════════════════════════════════
-#  GCN Track 2 configuration (deepAntigen atom-graph module)
+#  GCN Track 2 — Joint Pretraining (ALL params trainable)
 # ══════════════════════════════════════════════════════════════════
-use_gcn: true           # enable atom-graph spatial bias
-fusion_gcn: true        # fuse GCN top-k features into classifier
+use_gcn: true
+fusion_gcn: true
 
 gcn:
-  hidden_size: 128      # GCN hidden dimension
-  depth: 2              # number of TGCN layers
-  k: 10                 # top-k atoms to retain
-  heads: 4              # multi-head attention heads
-  in_channels: 25       # atom feature dimension
+  hidden_size: 128
+  depth: 2
+  k: 10
+  heads: 4
+  in_channels: 25
 
-gcn_freeze_encoder: true  # freeze GCN encoder, only train TopK + attention
+gcn_freeze_encoder: false       # Joint pretraining: train EVERYTHING
+
+# auxiliary GCN loss — forces gradient through GCN track
+lambda_gcn_aux: 1.0
 
 # ── pre-trained GCN checkpoint (optional) ───────────────────────
-# Set to a .pt file path to load pre-trained deepAntigen weights
 gcn_pretrained: ""
 
 model:
-  checkpoint_dir: runs/best_model_gcn/
+  checkpoint_dir: runs/best_model_gcn_joint/
 
 training:
   second_contrastive: True
-  batch_size: 8          # smaller batch due to graph memory
+  batch_size: 128              # 5090 32GB
   dropout: 0.08
   early_stopping:
-    patience: 5
-  epochs: 200
+    patience: 15
+  epochs: 50                  # joint pretraining: knowledge injection
   focal_gamma: 2.0
   lambda_int: 2.0
   lora_alpha: 32
   lora_dropout: 0.0
   lora_r: 32
   lr: 0.00005
-  output_dir: runs/gcn/
+  output_dir: runs/gcn_joint/
   temperature: 0.05
   weight_decay: 0.00005
 
 wandb:
-  project: ECHO-GCN
+  project: ECHO-GCN-Joint
   run: run1

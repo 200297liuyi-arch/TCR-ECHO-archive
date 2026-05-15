@@ -51,6 +51,7 @@ def load_checkpoint(Model, checkpoint_dir, class_imbalance, device='cuda'):
         'gcn_args':             gcn_args,
         'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
         'fusion_gcn':           cfg.get('fusion_gcn', True),
+        'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
     }
 
     model = Model(**model_params).to(device)
@@ -84,6 +85,12 @@ def compute_metrics(model, loader, device='cpu', use_graph=False, return_preds=F
             preds = torch.sigmoid(logits).cpu().numpy()
             all_preds.extend(preds.tolist())
             all_labels.extend(labels.cpu().numpy().tolist())
+
+    if len(all_labels) == 0:
+        empty = {'auc': 0.5, 'accuracy': 0.0, 'f1': 0.0}
+        if return_preds:
+            return empty, [], []
+        return empty, [], []
 
     auc = roc_auc_score(all_labels, all_preds)
     preds_bin = [1 if p >= 0.5 else 0 for p in all_preds]

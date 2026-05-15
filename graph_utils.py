@@ -48,11 +48,13 @@ def _get_featurizer() -> MolGraphConvFeaturizer:
     return _featurizer
 
 
-def sequence_to_graph(seq: str) -> DATA.Data:
+def sequence_to_graph(seq: str, mol=None) -> DATA.Data:
     """Convert an amino-acid sequence to a 2D topological atom graph.
 
     Uses RDKit MolFromSequence (no 3D structure needed) and the
     MolGraphConvFeaturizer to extract atom / bond features.
+
+    Pass a pre-built mol to avoid double RDKit parsing.
 
     Returns
     -------
@@ -60,7 +62,8 @@ def sequence_to_graph(seq: str) -> DATA.Data:
         PyG Data object with .x (node features), .edge_index, .edge_attr.
     """
     featurizer = _get_featurizer()
-    mol = Chem.MolFromSequence(seq)
+    if mol is None:
+        mol = Chem.MolFromSequence(seq)
     if mol is None:
         raise ValueError(f"RDKit could not parse sequence: {seq}")
     graph_data = featurizer._featurize(mol)

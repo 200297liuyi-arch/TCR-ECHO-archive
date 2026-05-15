@@ -44,8 +44,8 @@ gcn_pretrained: ""
 
 # ── Structure Dataset ────────────────────────────────────────────
 structure:
-  pdb_csv: /path/to/pdb_metadata.csv
-  data_dir: /path/to/pdb_data/
+  pdb_csv: /home/lyf/projects/deepAntigen/test_antigenTCR/Data/crystal_structure/info_noredudant.csv
+  data_dir: /home/lyf/projects/TCR-ECHO/datasets/pdb_structure/
 
 # ── Structure Training Hyperparameters ───────────────────────────
 structure_training:

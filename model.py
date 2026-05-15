@@ -43,6 +43,8 @@ class Model(nn.Module):
         use_structure: bool = False,
         contact_threshold: float = 5.0,
         fusion_gcn: bool = True,  # kept for checkpoint compatibility
+        # ── Auxiliary GCN loss ─────────────────────────────────────
+        lambda_gcn_aux: float = 1.0,
     ):
         super().__init__()
 
@@ -143,6 +145,14 @@ class Model(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.2),
             )
+
+            # auxiliary head: GCN-only classifier — forces gradient through GCN
+            self.gcn_aux_head = nn.Sequential(
+                nn.Linear(self.gcn_hidden, self.gcn_hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.gcn_hidden // 2, 1),
+            )
         else:
             self.gcn = None
 
@@ -170,6 +180,7 @@ class Model(nn.Module):
         self.contrastive_temp = contrastive_temp
         self.lambda_enc = lambda_enc
         self.lambda_int = lambda_int
+        self.lambda_gcn_aux = lambda_gcn_aux
 
         # ── Structure-aware training ───────────────────────────────
         self.use_structure = use_structure
@@ -247,6 +258,9 @@ class Model(nn.Module):
             F_spatial_raw = interaction_map.sum(dim=(1, 2))  # [B, H_gcn]
             F_spatial = self.gcn_spatial_proj(F_spatial_raw)  # [B, H]
 
+            # auxiliary GCN-only prediction — forces gradient through GCN
+            aux_logits = self.gcn_aux_head(F_spatial_raw).squeeze(-1)  # [B]
+
         # ══════════════════════════════════════════════════════════════
         #  Track 1 (Language): 3.3 Dual-View Cross-Attention
         #    View 1: sequence  |  View 2: Atchley bias
@@ -292,6 +306,14 @@ class Model(nn.Module):
                 )
             else:
                 total_loss = loss_focal + self.lambda_enc * loss_enc
+
+            if self.use_gcn and F_spatial is not None:
+                gcn_aux_loss = focal_loss(
+                    aux_logits, labels,
+                    gamma=self.focal_gamma,
+                    alpha=self.class_balance,
+                )
+                total_loss = total_loss + self.lambda_gcn_aux * gcn_aux_loss
 
             # ── Structure-aware losses (two-stage fine-tuning) ─────
             structure_loss = None
@@ -410,13 +432,6 @@ def flexible_peptide_contrastive(pmhc, tcr, labels, temp=0.2, mode='pooled'):
     denom = exp_sim.sum(dim=1)
     eps = 1e-8
     losses = -torch.log((numer + eps) / (denom + eps))
-
-    positive_anchor_mask = labels.bool()
-    if positive_anchor_mask.sum() > 0:
-        positive_loss = losses[positive_anchor_mask].mean()
-    else:
-        positive_loss = torch.tensor(0.0, device=device)
-
     return losses.mean()
 
 

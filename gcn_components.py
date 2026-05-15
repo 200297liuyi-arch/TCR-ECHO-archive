@@ -126,8 +126,12 @@ class SuperNodeExchange(nn.Module):
             2 * hidden_channels, hidden_channels,
             weight_initializer="kaiming_uniform"
         )
-        self.cross_attn = nn.MultiheadAttention(
-            hidden_channels, n_heads, batch_first=True
+        # Use Linear instead of MultiheadAttention — with 1 super-node per
+        # molecule, softmax over 1 key is always 1.0, so MHA degenerates
+        # to a linear projection. Linear is strictly more efficient.
+        self.cross_proj = pyg_linear.Linear(
+            hidden_channels, hidden_channels,
+            weight_initializer="kaiming_uniform"
         )
 
     def forward(self, pep_x, pep_batch, tcr_x, tcr_batch):
@@ -153,20 +157,9 @@ class SuperNodeExchange(nn.Module):
             self.gate_linear(torch.cat([s_tcr, s_pep], dim=-1))
         )
 
-        # 3. cross-attention: s_pep queries s_tcr's context, and vice versa
-        s_pep_ctx, _ = self.cross_attn(
-            s_pep.unsqueeze(1),    # query: pep super node
-            s_tcr.unsqueeze(1),    # key:   tcr super node
-            s_tcr.unsqueeze(1),    # value: tcr super node
-        )  # [B, 1, H]
-        s_tcr_ctx, _ = self.cross_attn(
-            s_tcr.unsqueeze(1),
-            s_pep.unsqueeze(1),
-            s_pep.unsqueeze(1),
-        )  # [B, 1, H]
-
-        s_pep_ctx = s_pep_ctx.squeeze(1)  # [B, H]
-        s_tcr_ctx = s_tcr_ctx.squeeze(1)  # [B, H]
+        # 3. cross-molecule projection: s_pep ← tcr info, s_tcr ← pep info
+        s_pep_ctx = self.cross_proj(s_tcr)  # [B, H] — tcr context for pep
+        s_tcr_ctx = self.cross_proj(s_pep)  # [B, H] — pep context for tcr
 
         # 4. gated residual update
         s_pep_new = s_pep + gate_pep * s_pep_ctx
@@ -392,7 +385,14 @@ class TopKPooling(nn.Module):
         perm, on_index = topk(score, self.ratio, chems, batch)
         x_top = xx[perm] * score[perm].view(-1, 1)
         bz = batch.max().item() + 1
-        x_top = x_top.view(bz, self.ratio, -1)
+        # When some graphs have fewer N/O atoms than k, pad to fixed size
+        expected = bz * self.ratio
+        if x_top.shape[0] < expected:
+            pad = x_top.new_zeros(expected - x_top.shape[0], x_top.shape[-1])
+            x_top = torch.cat([x_top, pad], dim=0)
+            dummy = torch.zeros(expected - perm.shape[0], dtype=perm.dtype, device=perm.device)
+            perm = torch.cat([perm, dummy])
+        x_top = x_top.reshape(bz, self.ratio, -1)
         return x_top, perm, score[on_index], on_index
 
 
@@ -549,21 +549,21 @@ class DeepGCN(nn.Module):
             tcr_x, cdr3_chems, tcr_batch
         )
 
-        # ── local atom indices within each molecule ──────────────────
+        # ── local atom indices within each molecule (vectorized, no .item()) ─
         num_nodes_pep = scatter_add(
             torch.ones_like(pep_batch), pep_batch, dim=0
         )
         num_nodes_tcr = scatter_add(
             torch.ones_like(tcr_batch), tcr_batch, dim=0
         )
-        p_perm_local = torch.zeros_like(p_perm)
-        c_perm_local = torch.zeros_like(c_perm)
-        for i, idx in enumerate(p_perm):
-            g = pep_batch[idx]
-            p_perm_local[i] = idx - sum(num_nodes_pep[:g.item()])
-        for i, idx in enumerate(c_perm):
-            g = tcr_batch[idx]
-            c_perm_local[i] = idx - sum(num_nodes_tcr[:g.item()])
+        cumsum_pep = torch.cat([
+            num_nodes_pep.new_zeros(1), num_nodes_pep.cumsum(0)[:-1]
+        ])
+        cumsum_tcr = torch.cat([
+            num_nodes_tcr.new_zeros(1), num_nodes_tcr.cumsum(0)[:-1]
+        ])
+        p_perm_local = p_perm - cumsum_pep[pep_batch[p_perm]]
+        c_perm_local = c_perm - cumsum_tcr[tcr_batch[c_perm]]
 
         # ── cross-molecule attention on top-k ────────────────────────
         interaction_map = self.peptide_cdr3_att(pep_topk, tcr_topk)
