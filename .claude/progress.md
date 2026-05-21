@@ -5,94 +5,139 @@
   WHEN: Update after completing each phase or encountering errors.
 -->
 
-## Session: 2026-05-13 (continued 2026-05-14)
+## Session: 2026-05-19 — Architecture Refactoring (4 major optimizations)
 
-### Phase 2: Joint Pretraining — Launch
-- **Status:** in_progress
-- **Started:** 2026-05-13 11:07 (first attempt) / 2026-05-14 11:21 (current launch)
-- Actions taken:
-  - Diagnosed empty val set crash (`val_joint.csv` had 0 rows; regenerated from 85/15 split on `Panpep_trainingData.csv`)
-  - Added safety guard in `utils.py:compute_metrics` for 0-sample predictions
-  - Added empty-dataloader check in `train.py:train_one` before epoch loop
-  - Diagnosed `NameError: name 'os' is not defined` — added `import os` to dataset.py
-  - Discovered graph precomputation takes ~90 min single-threaded (51k unique TCR sequences)
-  - Built multiprocessing `precompute_graphs.py`: Pool(32), workers write files directly to disk
-  - Precomputed 64,524 graphs in ~30 seconds (0 failures across all 3 datasets)
-  - Modified `dataset.py` to support `graph_cache_dir` — loads graphs from pickle cache <1s
-  - Added `graph_cache_dir` to `configs/config_gcn.yaml`
-  - Fixed `extraKnownMarketplaces` + `enabledPlugins` in `~/.claude/settings.json` (was invalid `skills` field)
-  - Rewrote `.claude/task_plan.md`, `.claude/findings.md`, `.claude/progress.md` in planning-with-files format
-  - Launched 50-epoch training (PID 964366, GPU 0, 6.4/32 GB)
-- Files created/modified:
-  - `precompute_graphs.py` (created) — multiprocessing graph precomputation with disk cache
-  - `datasets/panpep/graph_cache/` (created) — 64,524 pickle files
-  - `dataset.py` (modified) — graph_cache_dir, os import, lazy load from cache
-  - `utils.py` (modified) — empty-predictions guard in compute_metrics
-  - `train.py` (modified) — empty-dataloader check, cache_dir passthrough
-  - `configs/config_gcn.yaml` (modified) — graph_cache_dir field
-  - `~/.claude/settings.json` (modified) — plugin system config
-  - `.claude/task_plan.md` (rewritten) — planning-with-files template
-  - `.claude/findings.md` (rewritten) — planning-with-files template
-  - `.claude/progress.md` (rewritten) — planning-with-files template
+### Optimization 1: TopK All-Atom Selection
+- **Status:** complete
+- Removed N/O-only constraint in `gcn_components.py`
+- Deleted `generate_O_N()` and `from itertools import accumulate`
+- Rewrote `topk()`: per-molecule sort → top-k directly → local→global index conversion
+- k_i = min(ratio, n_atoms_i), handles molecules with fewer atoms than ratio
+- `on_index` now full atom list (0..total_atoms-1), compatible with Stage 1 Pearson loss
 
-### Phase 2: Training Monitor
-- **Status:** in_progress
-- **Started:** 2026-05-14 11:21
-- Observations:
-  - Dataset loads from cache: train 51,022 graphs + val 9,402 graphs, 0 missed
-  - ESM-2 650M ×2 loaded with LoRA r=8, GCN full params
-  - Initial: batch_size=6, GPU 6.4 GB, util 21-36%, ~2-4h/epoch
-  - After optimization: batch_size=128, GPU 11.2 GB, util **98%**, ~6.5 min/epoch
-  - AUC progress: 0.6782(bs=128)→0.6889(bs=128, reached before shared memory crash)
-- Pending:
-  - Relaunch with bs=128 + pickle-bytes dataset (fixes mmap shared memory OOM)
-  - Confirm 98% GPU util stable across epochs
-  - Complete full 50-epoch run
-  - Monitor GCN gradient health
+### Optimization 2: Spatial Feature Aggregation
+- **Status:** complete
+- Problem: `sum(dim=(1,2))` destroyed k×k spatial topology; single Linear(128→1280) was sparse
+- Fix 1: flatten [B,10,10,128] → [B,100,128] → masked Max/Avg pool
+  - Max: `masked_fill(-1e9)` → ghost atoms can't win
+  - Avg: `×mask` → sum / valid_count → correct mean, not diluted by ghosts
+  - cat(max, avg) → F_spatial_raw [B,256]
+- Fix 2: GCN projection → residual MLP 256→512→256 + LayerNorm + Identity shortcut
+- Files: `model.py`
 
-### Phase 2: GPU Utilization Optimization (2026-05-14 afternoon)
-- **Root cause of low GPU util (19-36%)**: num_workers=0 (default) — single-threaded tokenization; batch_size=6 too small; no pin_memory/non_blocking
-- **Optimizations applied:**
-  1. batch_size: 6 → 16 → 32 → 128 (VRAM: 6.4→7.1→11.2 GB)
-  2. DataLoader: num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4
-  3. `.to(device, non_blocking=True)` for async GPU transfer
-  4. Per-epoch `print` with PID + GPU utilization/memory/temperature via nvidia-smi
-- **Result**: GPU util 12-53% → **98-99%**, epoch time 2-4h → **6.5 min** (~20-40× speedup)
-- **Shared memory OOM** (bs=128): PyG Data objects stored directly caused mmap IPC overflow. Fixed by keeping pickled bytes in dataset, unpickling in collate_fn.
-- **Final config for relaunch**: bs=128, pickle-bytes dataset, 8 workers, all optimizations active
+### Optimization 3: Cross-Modal Gated Fusion
+- **Status:** complete
+- Problem: simple cat gave ESM 67% of fusion dim; classifier over-parameterized (3840×512)
+- Fix 1: ESM Projections — Linear(1280→512) + LayerNorm for both tcr and pep
+- Fix 2: Decoupled language gate — cat(tcr_proj, pep_proj) [1024] → MLP(1024→256→1024) → Sigmoid → split → W_tcr, W_pep (independent per-dimension weights)
+- Fix 3: Cross-modal physics gate — ctx_lang(512→128) + F_spatial(256) → MLP(384→64→256) → Sigmoid → W_phys
+- Fix 4: gated_tcr ⊙ W_tcr, gated_pep ⊙ W_pep, gated_phys ⊙ W_phys → cat [1280]
+- Fix 5: classifier input 3840→1280, params ~2.0M→~0.66M
+- Fusion dimensions: 512+512+256=1280 (balanced)
+- Files: `model.py`
 
-## Test Results
-<!-- Update as training progresses -->
-| Test | Input | Expected | Actual | Status |
-|------|-------|----------|--------|--------|
-| Dataset load (train) | cache dir | 51,022 graphs loaded | 51,022 loaded, 0 missed | ✓ |
-| Dataset load (val) | cache dir | 9,402 graphs loaded | 9,402 loaded, 0 missed | ✓ |
-| Graph precompute (3 datasets) | 32 workers | All graphs built, 0 failures | 64,524 files, 0 skipped | ✓ |
-| ESM model load | offline HF cache | Model loads on GPU | 6.4 GB GPU, weights ok | ✓ |
-| Training epoch 1 | 52,562 samples, 50 epochs | Running (no crash) | In progress | ⟳ |
+### Optimization 4: Loss Weight Cosine Annealing
+- **Status:** complete
+- Problem: fixed λ_gcn_aux=1.0 over-emphasized aux task; fixed λ_int=2.0 dominated language space
+- Fix 1: model.forward() now accepts `lambda_gcn_aux_override`, `lambda_int_override`
+- Fix 2: cosine_anneal() function in train.py, called per epoch
+- Fix 3: config section `loss_annealing` with start/end/schedule per weight
+- λ_gcn_aux: 1.0 → 0.1 (GCN cold start → yields to focal loss)
+- λ_int: 2.0 → 0.5 (contrastive focus → classifier gets more signal)
+- Annealed weights logged to wandb for monitoring
+- Files: `model.py`, `train.py`, `configs/config_gcn.yaml`
 
-## Error Log
-| Timestamp | Error | Attempt | Resolution |
-|-----------|-------|---------|------------|
-| 2026-05-13 11:50 | `ValueError: 0 sample(s)` in roc_auc_score | 1 | Regenerated val_joint.csv from 85/15 split |
-| 2026-05-13 11:50 | `ValueError: 0 sample(s)` in roc_auc_score | 2 | Added empty-preds guard in utils.py |
-| 2026-05-14 11:21 | `NameError: name 'os' is not defined` | 1 | Added `import os` to dataset.py |
-| 2026-05-14 11:21 | Graph precompute ~90 min single-threaded | 1 | Multiprocessing Pool(32), worker-direct writes → 30s |
-| 2026-05-14 11:21 | Old precompute script output (stale .pyc?) | 2 | Cleaned cache dir, verified file, relaunched |
-| 2026-05-13 ~15:00 | `skills` field not recognized | 1 | Replaced with `extraKnownMarketplaces` + `enabledPlugins` |
-| 2026-05-14 13:14 | `shape '[6, 10, -1]' invalid for input of size 7552` in TopKPooling | 1 | `tcr_CAFF` has only 9 N/O atoms < k=10; padded `x_top`+`perm` to fixed size |
-| 2026-05-13 ~15:00 | `Skill` tool returns "Unknown skill" | 1 | Superpowers needs session restart after settings fix |
-| 2026-05-14 17:30 | `RuntimeError: unable to mmap` in DataLoader IPC | 1 | PyG Data objects returned from __getitem__ overflowed /dev/shm via mmap; reverted to pickle bytes storage + unpickle in collate_fn |
-| 2026-05-14 ~17:00 | GPU utilization only 12-53% | 3 | ① batch_size 6→128 ② num_workers=8 + pin_memory + non_blocking + persistent_workers ③ per-epoch logging — result: 98% GPU util |
+### Files Modified (2026-05-19)
+| File | Changes |
+|------|---------|
+| `gcn_components.py` | topk() rewrite, removed generate_O_N/accumulate, updated comments |
+| `model.py` | spatial agg, GCN proj, gated fusion, ESM proj, loss overrides |
+| `train.py` | cosine_anneal(), per-epoch weight compute, pass to model, wandb log |
+| `configs/config_gcn.yaml` | loss_annealing section |
+| `CLAUDE.md` | Full architecture rewrite, updated state |
+| `.claude/task_plan.md` | Phase 5 added, decisions table expanded |
+| `.claude/progress.md` | This file |
+| `.claude/findings.md` | Architecture changes + decisions |
+
+## Session: 2026-05-17 — Cross-Graph Padding & Gradient Restoration
+
+### Phase 3: Critical Architecture Fixes
+- **Status:** complete (133-fold LOGO CV completed 2026-05-18)
+
+### Bug 17: Cross-Graph Atom Misalignment (2026-05-17)
+- **Root cause**: `TopKPooling.forward()` used `torch.cat([real, tail_pad]) → reshape(B, k, H)`. When molecules have different N/O counts, reshape steals atoms from adjacent molecules. Mol 0's row contains Mol 1's atoms.
+- **Fix**: Per-graph `torch.split(k_list)` → independent zero-pad → `torch.stack`. Each molecule's atoms stay in their own row. `valid_mask [B, k]` marks real vs ghost positions.
+- Files: `gcn_components.py` (topk, TopKPooling, DeepGCN)
+
+### Bug 18: Ghost Atom Leakage (2026-05-17)
+- Root cause: Padded positions in `[B,k]` tensors have zero features but non-zero bias through MHA and atom_contact_head. They participate in attention softmax, stealing weight from real atoms.
+- **Fix**: `joint_mask = (p_valid ⊗ c_valid).unsqueeze(-1)` → `[B,k,k,1]`. Injected at 3 layers: DeepGCN (interaction_map *= joint_mask), Stage 2 forward, and Focal loss filter.
+- Files: `gcn_components.py`, `train_structure.py`, `model.py`
+
+### Bug 19: Gradient Collapse from `reduction='mean'` (2026-05-17)
+- **Symptom**: Stage 2 loss 0.008 with `reduction='mean'` vs 1.30 with sum/B. Adam's ε floor (1e-8) dominates sqrt(v) for mean-scale gradients, shrinking effective step ~100×.
+- **Fix**: `reduction='sum'` over real pairs only, then `/batch_size`. Restores ~90× gradient scale. Adam step ≈ lr × 0.9 after warmup.
+- Files: `train_structure.py` (finetune_stage2, evaluate_stage2), `model.py` (_compute_structure_loss)
+
+### Bug 20: Scheduler Threshold Blindness (2026-05-17)
+- **Symptom**: Fold 2 val_loss ≈ 0.003. Scheduler `threshold=0.01` absolute — requires improvement > 0.01 which is 3× val_loss itself. Scheduler sees no improvement, cuts LR → death spiral.
+- **Fix**: `threshold_mode='rel'`, `threshold=0.001` (0.1% relative). Adapts to any loss scale. Also `factor=0.75` (gentler than 0.5).
+- Files: `train_structure.py`
+
+### Bug 21: Collapsed Model Resets Patience Counter (2026-05-17)
+- **Symptom**: Fold 2 epoch 40: train=0.0037 val=0.0033 → model collapsed but val < min_val → saved as "best" → counter reset → early stopping defeated.
+- **Fix**: Collapse guard — `train_loss < 0.01 * initial_train_loss` (fold-adaptive). Collapsed epochs are ineligible for saving AND count as non-improvement.
+- Files: `train_structure.py`
+
+### Bug 22: LR Floor Unreachable (2026-05-17)
+- **Symptom**: `min_lr = stage2_lr * 1e-4 = 1e-7`. With factor=0.5 and patience=30: needs 10 reductions × 30 = 300 epochs to trigger. Stage 2 only has 200 epochs.
+- **Fix**: Replaced with patience-based early stopping: counter=0, patience=80. Every epoch without val improvement → counter++. Counter hits 80 → break. Collapse guard prevents counter reset.
+- Files: `train_structure.py`
+
+### Bug 23: Checkpoint Size Bloat (2026-05-17)
+- **Symptom**: Intended ~5MB per checkpoint, actual 62MB. Lightweight filter (`requires_grad=True`) catches cross_attn, classifier, gcn_aux_head — these are trainable in the full model but NOT in the Stage 2 optimizer scope.
+- **Fix pending**: Filter by `stage2_opt.param_groups` parameter IDs instead of global `requires_grad`.
+- Files: `train_structure.py` (save logic)
+
+### Architecture Diff: 2026-05-15 → 2026-05-18
+| Component | Old (2026-05-15) | Final (2026-05-18) |
+|-----------|-----------------|---------------------|
+| TopK padding | cat+reshape (misalignment) | split→pad→stack + valid_mask |
+| Ghost atoms | Leaked through MHA+gate | joint_mask [B,k,k,1] at 3 layers |
+| Stage 2 loss reduction | sum (tail-padded) | sum/B (real pairs only) |
+| Scheduler threshold | abs=0.01 | rel=0.001 |
+| Scheduler factor | 0.5 | 0.75 |
+| Early stopping | LR floor (unreachable) | patience=80 + collapse guard |
+| weight_decay (Stage 2) | 1e-4 | 1e-6 |
+| Checkpoint | 5.4 GB (full model) | ~5MB intended, 62MB actual (bug 23) |
+
+### Phase 3: 133-Fold LOGO CV Results (2026-05-18)
+- **Completed**: All 133 folds trained
+- **Early stopping**: 95/133 folds triggered (patience=80), 38/133 ran full 200 epochs
+- **Best val loss**: min=0.0000, max=0.3708, mean=0.090
+- **Checkpoints**: 133 PDB directories, 8GB total
+- **Log**: `runs/structure/training.log`
+
+### Files Modified (cumulative 2026-05-17/18)
+| File | Changes |
+|------|---------|
+| `gcn_components.py` | topk returns k; TopKPooling split/pad/stack + valid_mask; DeepGCN joint_mask |
+| `train_structure.py` | sum/B reduction; rel threshold; patience early stopping; collapse guard; wd=1e-6; lightweight save |
+| `model.py` | _compute_structure_loss Stage 2: joint_mask + sum/B |
+| `configs/config_structure.yaml` | (unchanged this session) |
+| `CLAUDE.md`, `task_plan.md`, `progress.md`, `findings.md` | Documentation sync |
+
+## Session: 2026-05-16 — Critical Bug Hunt & Architecture Hardening
+(see previous version for full details — 4 rounds of refactoring)
+
+## Session: 2026-05-14/15 — Phase 2 Complete
+(see previous version for full details — joint pretraining AUC 0.7914)
 
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 2 — Joint Pretraining (bs=128, GPU 98% util, about to relaunch) |
-| Where am I going? | Phase 3 (Structure Fine-Tuning) → Phase 4 (Full Evaluation) |
-| What's the goal? | Train dual-track ESM-2 + GCN TCR-peptide binding predictor |
-| What have I learned? | Graph cache = 180× speedup; GCN gradients flow at λ=1.0; bs=128 + DataLoader opts → GPU 98% |
-| What have I done? | Fixed bugs, built cache, optimized throughput 20-40×, ready for 50-epoch run |
-
----
-*Update after completing each phase or encountering errors*
+| Where am I? | Architecture refactoring complete, ready for Phase 2 re-training |
+| Where am I going? | Re-train Phase 2 with optimized model → Phase 4 zero-shot evaluation |
+| What's the goal? | Train dual-track ESM-2 + GCN TCR-peptide binding predictor with balanced modalities |
+| What have I learned? | Gated fusion prevents modality dominance; masked pooling preserves spatial signals; cosine annealing helps cold-start |
+| What have I done? | 4 architecture optimizations: all-atom TopK, masked pool aggregation, gated fusion, loss annealing |

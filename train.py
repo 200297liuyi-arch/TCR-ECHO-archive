@@ -1,4 +1,5 @@
 import os
+import math
 import yaml
 import torch
 import wandb
@@ -9,7 +10,14 @@ from transformers import AutoTokenizer
 from model import Model
 from dataset import TCRPeptideDataset, collate_graph_batch
 from utils import save_checkpoint, compute_metrics, load_atchley, load_checkpoint
-from train_structure import train_structure_pipeline
+
+
+def cosine_anneal(epoch, total_epochs, start_val, end_val):
+    """Cosine annealing from start_val → end_val over total_epochs."""
+    if total_epochs <= 1:
+        return start_val
+    progress = epoch / max(total_epochs - 1, 1)
+    return end_val + 0.5 * (start_val - end_val) * (1 + math.cos(math.pi * progress))
 
 
 def train_one(cfg, epochs, run_name_suffix=""):
@@ -93,9 +101,8 @@ def train_one(cfg, epochs, run_name_suffix=""):
         'use_gcn':              use_graph,
         'gcn_args':             gcn_args,
         'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
-        'fusion_gcn':           cfg.get('fusion_gcn', True),
         'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
-        'cross_attn_dropout':   cfg.get('cross_attn_dropout', 0.1),
+        'cross_attn_dropout':   cfg['training'].get('cross_attn_dropout', 0.1),
     }
 
     model = Model(**model_params).to(cfg.get('device', 'cpu'))
@@ -114,8 +121,24 @@ def train_one(cfg, epochs, run_name_suffix=""):
             f"Val loader has 0 batches ({len(val_ds)} samples loaded "
             f"from {cfg['dataset']['val_csv']}). Check data file.")
 
+    # ── Loss annealing config ─────────────────────────────────────
+    anneal_cfg = cfg.get('loss_annealing', {})
+    gcn_aux_cfg = anneal_cfg.get('lambda_gcn_aux', {})
+    lint_cfg = anneal_cfg.get('lambda_int', {})
+
+    patience = cfg['training']['early_stopping']['patience']
     best_auc = 0
+    no_improve = 0
     for epoch in range(epochs):
+        # ── Compute annealed loss weights ──────────────────────────
+        lambda_gcn_aux_now = lambda_int_now = None
+        if gcn_aux_cfg.get('schedule') == 'cosine':
+            lambda_gcn_aux_now = cosine_anneal(
+                epoch, epochs, gcn_aux_cfg['start'], gcn_aux_cfg['end'])
+        if lint_cfg.get('schedule') == 'cosine':
+            lambda_int_now = cosine_anneal(
+                epoch, epochs, lint_cfg['start'], lint_cfg['end'])
+
         # ── train ───────────────────────────────────────────────────
         model.train()
         losses = []
@@ -132,6 +155,8 @@ def train_one(cfg, epochs, run_name_suffix=""):
                     tcr_graphs=tcr_graphs, pep_graphs=pep_graphs,
                     tcr_mols=tcr_mols, pep_mols=pep_mols,
                     tcr_a2r=tcr_a2r, pep_a2r=pep_a2r,
+                    lambda_gcn_aux_override=lambda_gcn_aux_now,
+                    lambda_int_override=lambda_int_now,
                 )
             else:
                 inp1, msk1, inp2, msk2, at1, at2, labels = batch
@@ -150,6 +175,8 @@ def train_one(cfg, epochs, run_name_suffix=""):
             'train_loss': avg_loss,
             **{f'val_{k}': v for k, v in val_metrics.items()},
             'epoch': epoch,
+            **({'lambda_gcn_aux': lambda_gcn_aux_now} if lambda_gcn_aux_now is not None else {}),
+            **({'lambda_int': lambda_int_now} if lambda_int_now is not None else {}),
         })
 
         now = __import__('datetime').datetime.now().strftime('%H:%M:%S')
@@ -168,20 +195,22 @@ def train_one(cfg, epochs, run_name_suffix=""):
             best_auc = val_metrics['auc']
             save_checkpoint(model, optimizer, cfg, best_auc,
                             cfg['training']['output_dir'])
+            no_improve = 0
+        else:
+            no_improve += 1
+        if no_improve >= patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
 
     run.finish()
     return best_auc
 
 
-def main(config, structure_mode=False):
+def main(config):
     with open(config) as f:
         cfg = yaml.safe_load(f)
 
     device = cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-
-    if structure_mode:
-        _run_structure_training(cfg, device)
-        return
 
     best_auc = train_one(cfg, epochs=cfg['training']['epochs'])
 
@@ -223,80 +252,11 @@ def main(config, structure_mode=False):
     print("Final test metrics:", test_metrics)
 
 
-def _run_structure_training(cfg, device):
-    """Run two-stage fine-tuning on PDB structure data."""
-    import torch
-
-    # ── Build model with structure support ────────────────────────
-    lora_preset = cfg['lora']['presets'][cfg['esm']['encoder1']]
-    gcn_args = cfg.get('gcn', None)
-    class_balance = 0.5  # default for structure mode
-
-    model_params = {
-        'esm1_name': cfg['esm']['encoder1'],
-        'esm2_name': cfg['esm']['encoder2'],
-        'use_lora': cfg['use_lora'],
-        'lora_r': lora_preset['r'],
-        'lora_alpha': lora_preset['alpha'],
-        'lora_dropout': lora_preset['dropout'],
-        'lora_target_modules': lora_preset['layers_to_transform'],
-        'contrastive_temp': cfg['contrastive']['temperature'],
-        'lambda_enc': cfg['contrastive']['lambda_enc'],
-        'lambda_int': cfg['contrastive']['lambda_int'],
-        'classifier_hidden': cfg['classifier_hidden'],
-        'dropout': cfg['training'].get('dropout', 0.1),
-        'focal_gamma': cfg['training']['focal_gamma'],
-        'class_balance': class_balance,
-        'use_gcn': True,
-        'gcn_args': gcn_args,
-        'gcn_freeze_encoder': cfg.get('gcn_freeze_encoder', True),
-        'lambda_gcn_aux':   cfg.get('lambda_gcn_aux', 1.0),
-        'use_structure': True,
-        'contact_threshold': cfg.get('structure_training', {}).get(
-            'contact_threshold', 5.0
-        ),
-    }
-
-    model = Model(**model_params).to(device)
-
-    # ── Load pre-trained ECHO weights (Phase 1+2) ─────────────────
-    echo_ckpt = cfg.get('echo_pretrained', '')
-    if echo_ckpt and os.path.exists(echo_ckpt):
-        state = torch.load(echo_ckpt, map_location=device)
-        model.load_state_dict(state.get('model', state), strict=False)
-        print(f"Loaded ECHO pretrained weights from {echo_ckpt}")
-
-    # ── Load deepAntigen GCN weights (optional) ────────────────────
-    gcn_ckpt = cfg.get('gcn_pretrained', '')
-    if gcn_ckpt and os.path.exists(gcn_ckpt):
-        state = torch.load(gcn_ckpt, map_location=device)
-        gcn_state = state.get('model', state)
-        # Only load GCN-related keys
-        gcn_keys = {k: v for k, v in gcn_state.items()
-                     if k.startswith('gcn.') or k.startswith('peptide_encoder.')
-                     or k.startswith('cdr3_encoder.')}
-        model.load_state_dict(gcn_keys, strict=False)
-        print(f"Loaded GCN pretrained weights from {gcn_ckpt}")
-
-    # ── Merge structure args from config ──────────────────────────
-    struct_args = cfg.get('structure_training', {})
-    struct_args['pdb_csv'] = cfg['structure']['pdb_csv']
-    struct_args['data_dir'] = cfg['structure'].get('data_dir', '')
-    struct_args['k'] = gcn_args['k']
-    struct_args.setdefault('save_dir', 'runs/structure/')
-
-    train_structure_pipeline(model, device, struct_args)
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train ECHO model")
     parser.add_argument(
         "--config", type=str, default="params/config.yaml",
         help="Path to config file",
     )
-    parser.add_argument(
-        "--structure", action="store_true",
-        help="Run two-stage 3D structure fine-tuning mode",
-    )
     args = parser.parse_args()
-    main(args.config, structure_mode=args.structure)
+    main(args.config)

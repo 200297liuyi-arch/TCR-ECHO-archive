@@ -50,7 +50,6 @@ def load_checkpoint(Model, checkpoint_dir, class_imbalance, device='cuda'):
         'use_gcn':              use_gcn,
         'gcn_args':             gcn_args,
         'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
-        'fusion_gcn':           cfg.get('fusion_gcn', True),
         'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
     }
 

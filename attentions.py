@@ -90,16 +90,17 @@ class BidirectionalDualViewAttention(nn.Module):
             head_bias = torch.einsum("bip,pq,bjq->bij", atc_q, U_h, atc_kv)
             S_bio[:, h] = head_bias  # [B, Lq, Lkv]
 
-        # Fusion with shared ρ
+        # Normalize each attention separately, then interpolate
+        # (ECHO paper eq: avoids one view dominating softmax via scale differences)
         rho = (torch.tanh(self.mix_param) + 1) / 2  # [0, 1]
-        combined = S_seq * (1 - rho) + S_bio * rho
+        attn_seq = F.softmax(S_seq, dim=-1)
+        attn_bio = F.softmax(S_bio, dim=-1)
+        attn = self.dropout(attn_seq * (1 - rho) + attn_bio * rho)
 
         if self.enable_monitoring:
             with torch.no_grad():
                 self.rho_history[self.history_idx] = rho.item()
                 self.history_idx = (self.history_idx + 1) % 100
-
-        attn = self.dropout(F.softmax(combined, dim=-1))
         out = attn @ v  # [B, H, Lq, Dh]
         out = out.transpose(1, 2).reshape(B, Lq, self.dim)
         return out_proj(out)

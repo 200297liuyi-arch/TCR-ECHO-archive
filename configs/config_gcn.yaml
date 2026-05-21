@@ -88,6 +88,17 @@ gcn_freeze_encoder: false       # Joint pretraining: train EVERYTHING
 # auxiliary GCN loss — forces gradient through GCN track
 lambda_gcn_aux: 1.0
 
+# ── Loss weight annealing (cosine decay over training) ────────────
+loss_annealing:
+  lambda_gcn_aux:
+    start: 1.0
+    end: 0.1
+    schedule: cosine          # cosine | linear | none
+  lambda_int:
+    start: 2.0
+    end: 0.5
+    schedule: cosine          # optional: decay contrastive weight too
+
 # ── pre-trained GCN checkpoint (optional) ───────────────────────
 gcn_pretrained: ""
 
@@ -96,11 +107,12 @@ model:
 
 training:
   second_contrastive: True
-  batch_size: 128              # 5090 32GB
-  dropout: 0.08
+  batch_size: 32
+  dropout: 0.3
+  cross_attn_dropout: 0.3
   early_stopping:
-    patience: 15
-  epochs: 50                  # joint pretraining: knowledge injection
+    patience: 10
+  epochs: 200
   focal_gamma: 2.0
   lambda_int: 2.0
   lora_alpha: 32
@@ -109,7 +121,7 @@ training:
   lr: 0.00005
   output_dir: runs/gcn_joint/
   temperature: 0.05
-  weight_decay: 0.00005
+  weight_decay: 0.0001
 
 wandb:
   project: ECHO-GCN-Joint

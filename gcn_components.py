@@ -7,7 +7,7 @@ Architecture per layer:
   + BatchNorm after each layer
 
 After all L layers:
-  TopKPooling (N/O-biased) → MultiHeadAttention → interaction_map [B,k,k,H]
+  TopKPooling (all-atom scoring) → MultiHeadAttention → interaction_map [B,k,k,H]
 
 Key insight: unlike deepAntigen's TCR model (independent encoders, cross-attn
 only at the end), here peptide and TCR atoms engage in gated dialogue at EVERY
@@ -17,8 +17,6 @@ molecule's global state throughout the encoding process.
 
 import math
 from typing import Callable
-from itertools import accumulate
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -232,84 +230,52 @@ class CrossModalGCNLayer(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Top-K pooling helpers  (with N / O atom constraint)
+#  Top-K pooling helpers  (all-atom selection)
 # ══════════════════════════════════════════════════════════════════════
 
-def generate_O_N(chems, max_num_nodes):
-    index_parallel = []
-    index = []
-    num_nodes = []
-    cum_atom_num = 0
-    for i, chem in enumerate(chems):
-        atom_index_parallel = [
-            idx + i * max_num_nodes
-            for idx, atom in enumerate(chem.GetAtoms())
-            if atom.GetSymbol() in ["N", "O"]
-        ]
-        index_parallel.extend(atom_index_parallel)
-        atom_index = [
-            idx + cum_atom_num
-            for idx, atom in enumerate(chem.GetAtoms())
-            if atom.GetSymbol() in ["N", "O"]
-        ]
-        num_nodes.append(len(atom_index))
-        index.extend(atom_index)
-        cum_atom_num += len(chem.GetAtoms())
-    return index_parallel, num_nodes, index
-
-
 def topk(x, ratio, chems, batch):
+    """Select top-k atoms per molecule by score. All atoms participate.
+
+    Returns:
+        perm: [sum(k_i)] global flat indices of selected atoms
+        on_index: list of all atom global indices (0..total_atoms-1)
+        k: [B] tensor, k_i = min(ratio, n_atoms_i)
+    """
     num_nodes = scatter_add(batch.new_ones(x.size(0)), batch, dim=0)
     batch_size, max_num_nodes = num_nodes.size(0), num_nodes.max().item()
 
     cum_num_nodes = torch.cat(
         [num_nodes.new_zeros(1), num_nodes.cumsum(dim=0)[:-1]], dim=0
     )
-    rich_num_nodes = torch.full((batch_size,), max_num_nodes, device=x.device)
-    cum_rich_num_nodes = torch.cat(
-        [rich_num_nodes.new_zeros(1), rich_num_nodes.cumsum(dim=0)[:-1]], dim=0
-    )
-    void_num_nodes = max_num_nodes - num_nodes
-    cum_void_num_nodes = torch.cat(
-        [void_num_nodes.new_zeros(1), void_num_nodes.cumsum(dim=0)[:-1]], dim=0
-    )
 
-    index = torch.arange(batch.size(0), dtype=torch.long, device=x.device)
-    index = (index - cum_num_nodes[batch]) + (batch * max_num_nodes)
+    # Dense score matrix [B, max_num_nodes] — ghost positions = -inf, sort to end
+    idx_flat = torch.arange(batch.size(0), dtype=torch.long, device=x.device)
+    dense_idx = (idx_flat - cum_num_nodes[batch]) + (batch * max_num_nodes)
 
     dense_x = x.new_full((batch_size * max_num_nodes,), torch.finfo(x.dtype).min)
-    dense_x[index] = x
+    dense_x[dense_idx] = x
     dense_x = dense_x.view(batch_size, max_num_nodes)
 
-    _, perm = dense_x.sort(dim=-1, descending=True)
-    perm = perm + cum_rich_num_nodes.view(-1, 1)
-    perm = perm.view(-1)
+    # Sort descending per molecule — real atoms score > -inf, come first
+    _, perm_local = dense_x.sort(dim=-1, descending=True)  # [B, max_num_nodes]
 
-    on_index_parallel, on_num, on_index = generate_O_N(chems, max_num_nodes)
-    on_index_parallel = torch.LongTensor(on_index_parallel).to(x.device)
-    offset = list(accumulate(on_num))
-    offset = [0] + offset[:-1]
+    # k_i = min(ratio, n_atoms_i) — handles molecules with < ratio atoms
+    k = torch.full((batch_size,), ratio, device=x.device, dtype=num_nodes.dtype)
+    k = torch.min(k, num_nodes)
 
-    indices = torch.where(perm == on_index_parallel[:, None])[1]
-    indices, _ = indices.sort()
+    # Take top-k per molecule → global un-padded indices
+    perm_parts = []
+    for i in range(batch_size):
+        ki = k[i].item()
+        mol_topk = perm_local[i, :ki] + cum_num_nodes[i]
+        perm_parts.append(mol_topk)
+    perm = torch.cat(perm_parts)
 
-    k = num_nodes.new_full((num_nodes.size(0),), ratio)
-    on_num_t = torch.tensor(on_num, device=x.device)
-    offset_t = torch.tensor(offset, device=x.device)
-    k = torch.min(k, on_num_t)
-    pre_mask = [
-        torch.arange(k[i], dtype=torch.long, device=x.device) + offset_t[i]
-        for i in range(batch_size)
-    ]
-    pre_mask = torch.cat(pre_mask, dim=0)
-    mask = indices[pre_mask.long()]
+    # All-atom global index list (replaces N/O-only on_index)
+    total_atoms = int(num_nodes.sum().item())
+    on_index = list(range(total_atoms))
 
-    perm = perm.view(batch_size, max_num_nodes)
-    perm = perm - cum_void_num_nodes.view(-1, 1)
-    perm = perm.view(-1)
-    perm = perm[mask]
-
-    return perm.long(), on_index
+    return perm.long(), on_index, k
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -342,7 +308,7 @@ class PositionalEncoding(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TopKPooling  — with N/O constraint
+#  TopKPooling  — all-atom top-k selection by learned score
 # ══════════════════════════════════════════════════════════════════════
 
 class TopKPooling(nn.Module):
@@ -382,18 +348,63 @@ class TopKPooling(nn.Module):
         xx_t = F.leaky_relu(self.layer_atom3(xx_t), 0.1)
         score = (xx_t * self.weight_atom).sum(dim=-1)
         score = self.nonlinearity(score / self.weight_atom.norm(p=2, dim=-1))
-        perm, on_index = topk(score, self.ratio, chems, batch)
-        x_top = xx[perm] * score[perm].view(-1, 1)
+        perm, on_index, k_per_mol = topk(score, self.ratio, chems, batch)
+        # perm: [sum(k_i)] flat global atom indices
+        # k_per_mol: [B] k_i = min(ratio, n_atoms_i) per molecule
+        topk_scores_flat = score[perm]                        # [sum(k_i)]
+        x_top_flat = xx[perm] * topk_scores_flat.unsqueeze(-1)
+
         bz = batch.max().item() + 1
-        # When some graphs have fewer N/O atoms than k, pad to fixed size
-        expected = bz * self.ratio
-        if x_top.shape[0] < expected:
-            pad = x_top.new_zeros(expected - x_top.shape[0], x_top.shape[-1])
-            x_top = torch.cat([x_top, pad], dim=0)
-            dummy = torch.zeros(expected - perm.shape[0], dtype=perm.dtype, device=perm.device)
-            perm = torch.cat([perm, dummy])
-        x_top = x_top.reshape(bz, self.ratio, -1)
-        return x_top, perm, score[on_index], on_index
+        k_list = k_per_mol.tolist()
+
+        # ── Global → local atom index per molecule ───────────────────
+        num_nodes = scatter_add(batch.new_ones(batch.size(0)), batch, dim=0)
+        cum_atoms = torch.cat([num_nodes.new_zeros(1),
+                               num_nodes.cumsum(0)[:-1]], dim=0)  # [B]
+
+        # ── Per-graph split → independent zero-pad → stack ───────────
+        # Each molecule gets its own k atoms (no cross-graph contamination)
+        x_splits = torch.split(x_top_flat, k_list)
+        score_splits = torch.split(topk_scores_flat, k_list)
+        perm_splits = torch.split(perm, k_list)
+
+        x_padded, score_padded, perm_padded, valid_list = [], [], [], []
+        ratio = self.ratio
+        feat_dim = x_top_flat.shape[-1]
+        for i in range(bz):
+            ki = k_list[i]
+            need = ratio - ki
+            # convert global perm → local (within molecule i)
+            local_perm = perm_splits[i] - cum_atoms[i].item()
+            if need > 0:
+                x_padded.append(torch.cat([
+                    x_splits[i],
+                    x_splits[i].new_zeros(need, feat_dim),
+                ]))
+                score_padded.append(torch.cat([
+                    score_splits[i],
+                    score_splits[i].new_zeros(need),
+                ]))
+                perm_padded.append(torch.cat([
+                    local_perm,
+                    local_perm.new_zeros(need),
+                ]))
+                valid_list.append(torch.cat([
+                    torch.ones(ki, device=x.device),
+                    torch.zeros(need, device=x.device),
+                ]))
+            else:
+                x_padded.append(x_splits[i])
+                score_padded.append(score_splits[i])
+                perm_padded.append(local_perm)
+                valid_list.append(torch.ones(ratio, device=x.device))
+
+        x_top = torch.stack(x_padded)            # [B, k, H]
+        topk_scores = torch.stack(score_padded)  # [B, k]
+        perm_local = torch.stack(perm_padded)    # [B, k]  local indices per molecule
+        valid_mask = torch.stack(valid_list)     # [B, k]  1=real, 0=pad
+
+        return x_top, perm_local, score[on_index], on_index, topk_scores, valid_mask
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -457,7 +468,7 @@ class DeepGCN(nn.Module):
         + BatchNorm after each layer
 
       After L layers:
-        TopKPooling (N/O-biased)  → select k key atoms per molecule
+        TopKPooling (all-atom scoring) → select k key atoms per molecule
         MultiHeadAttention        → interaction map [B, k, k, H]
 
     Key design: unlike deepAntigen's TCR model (independent encoders),
@@ -513,13 +524,18 @@ class DeepGCN(nn.Module):
         dict with keys:
           peptide_topk : [B, k, H]
           cdr3_topk : [B, k, H]
-          p_perm : [B*k]  local atom indices within peptide molecules
-          c_perm : [B*k]  local atom indices within TCR molecules
-          p_scores : [B*k]  TopK attention scores (N/O atoms only)
-          c_scores : [B*k]
-          p_indexs : N/O atom index list (for structure loss)
-          c_indexs : N/O atom index list
-          interaction_map : [B, k, k, H]
+          p_perm : [B, k]  local atom indices per molecule (ghost pads = 0)
+          c_perm : [B, k]
+          p_scores : [n_atoms]  TopK scores of all atoms
+          c_scores : [n_atoms]
+          p_topk_scores : [B, k]  scores of selected top-k atoms (ghost pads = 0)
+          c_topk_scores : [B, k]
+          p_indexs : all-atom index list (for Stage 1 Pearson loss)
+          c_indexs : all-atom index list
+          p_valid : [B, k]  1=real atom, 0=ghost padding
+          c_valid : [B, k]
+          joint_mask : [B, k, k, 1]  1=real atom pair, 0=ghost padding
+          interaction_map : [B, k, k, H]  ghost-masked (padded positions = 0)
         """
         # ── initial projection ───────────────────────────────────────
         pep_x = F.leaky_relu(self.init_w_pep(peptide_graphs.x), 0.1)
@@ -541,43 +557,43 @@ class DeepGCN(nn.Module):
             pep_x = self.bn_pep[i](pep_x)
             tcr_x = self.bn_tcr[i](tcr_x)
 
-        # ── TopK pooling (N/O-biased) ────────────────────────────────
-        pep_topk, p_perm, p_scores, p_indexs = self.topk_pep(
+        # ── TopK pooling (all-atom scoring) ─────────────────────────
+        pep_topk, p_perm, p_scores, p_indexs, p_topk_scores, p_valid = self.topk_pep(
             pep_x, peptide_chems, pep_batch
         )
-        tcr_topk, c_perm, c_scores, c_indexs = self.topk_tcr(
+        tcr_topk, c_perm, c_scores, c_indexs, c_topk_scores, c_valid = self.topk_tcr(
             tcr_x, cdr3_chems, tcr_batch
         )
+        # p_perm, c_perm: [B, k] — already local per-molecule indices from TopKPooling
 
-        # ── local atom indices within each molecule (vectorized, no .item()) ─
-        num_nodes_pep = scatter_add(
-            torch.ones_like(pep_batch), pep_batch, dim=0
-        )
-        num_nodes_tcr = scatter_add(
-            torch.ones_like(tcr_batch), tcr_batch, dim=0
-        )
-        cumsum_pep = torch.cat([
-            num_nodes_pep.new_zeros(1), num_nodes_pep.cumsum(0)[:-1]
-        ])
-        cumsum_tcr = torch.cat([
-            num_nodes_tcr.new_zeros(1), num_nodes_tcr.cumsum(0)[:-1]
-        ])
-        p_perm_local = p_perm - cumsum_pep[pep_batch[p_perm]]
-        c_perm_local = c_perm - cumsum_tcr[tcr_batch[c_perm]]
+        # ── joint valid mask: 1=real atom pair, 0=ghost padding ─────
+        # [B, k] ⊗ [B, k] → [B, k, k] → unsqueeze → [B, k, k, 1]
+        joint_mask = (p_valid.unsqueeze(-1) * c_valid.unsqueeze(1)).unsqueeze(-1)
 
         # ── cross-molecule attention on top-k ────────────────────────
         interaction_map = self.peptide_cdr3_att(pep_topk, tcr_topk)
+        # Kill ghost-atom contributions: padded positions → zero features
+        interaction_map = interaction_map * joint_mask
+
+        # ── zero out padded perms for safety ─────────────────────────
+        p_perm = p_perm * p_valid.long()
+        c_perm = c_perm * c_valid.long()
 
         return {
             "peptide_topk": pep_topk,            # [B, k, H_gcn]
             "cdr3_topk": tcr_topk,               # [B, k, H_gcn]
-            "p_perm": p_perm_local,              # local atom indices
-            "c_perm": c_perm_local,
+            "p_perm": p_perm,                    # [B, k] local atom indices
+            "c_perm": c_perm,                    # [B, k]
             "p_scores": p_scores,
             "c_scores": c_scores,
-            "p_indexs": p_indexs,                # N/O atom indices
+            "p_topk_scores": p_topk_scores,       # [B, k] scores of top-k atoms
+            "c_topk_scores": c_topk_scores,       # [B, k]
+            "p_indexs": p_indexs,                 # all-atom indices (all, not top-k)
             "c_indexs": c_indexs,
-            "interaction_map": interaction_map,   # [B, k, k, H_gcn]
+            "p_valid": p_valid,                   # [B, k] 1=real, 0=ghost padding
+            "c_valid": c_valid,                   # [B, k]
+            "joint_mask": joint_mask,             # [B, k, k, 1]
+            "interaction_map": interaction_map,    # [B, k, k, H_gcn] (ghost-masked)
         }
 
     def freeze_encoder(self):
