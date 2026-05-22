@@ -18,7 +18,7 @@ def save_checkpoint(model, optimizer, cfg, best_metric, out_dir):
         yaml.safe_dump(cfg, f)
 
 
-def load_checkpoint(Model, checkpoint_dir, class_imbalance, device='cuda'):
+def load_checkpoint(ModelClass, checkpoint_dir, class_imbalance, device='cuda'):
     path = os.path.join(checkpoint_dir, 'best_model.pth')
     import torch.serialization
     from numpy.core.multiarray import scalar
@@ -28,8 +28,6 @@ def load_checkpoint(Model, checkpoint_dir, class_imbalance, device='cuda'):
     cfg = chk['config']
     lora_preset = cfg['lora']['presets'][cfg['esm']['encoder1']]
     use_lora = cfg.get('use_lora', True)
-    use_gcn = cfg.get('use_gcn', False)
-    gcn_args = cfg.get('gcn', None)
 
     model_params = {
         'esm1_name':            cfg['esm']['encoder1'],
@@ -47,13 +45,9 @@ def load_checkpoint(Model, checkpoint_dir, class_imbalance, device='cuda'):
         'focal_gamma':          cfg['training']['focal_gamma'],
         'class_balance':        class_imbalance,
         'second_contrastive':   cfg['training'].get('second_contrastive', True),
-        'use_gcn':              use_gcn,
-        'gcn_args':             gcn_args,
-        'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
-        'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
     }
 
-    model = Model(**model_params).to(device)
+    model = ModelClass(**model_params).to(device)
     model.load_state_dict(chk['model_state'])
     model.eval()
 

@@ -1,9 +1,66 @@
 # Progress Log
-<!--
-  WHAT: Session log — chronological record of what was done, when, and what happened.
-  WHY: Answers "What have I done?" in the 5-Question Reboot Test. Helps resume after breaks.
-  WHEN: Update after completing each phase or encountering errors.
--->
+<!-- Session log — chronological record of what was done, when, and what happened. -->
+
+## Session: 2026-05-21 — GCN Architecture Alignment with deepAntigen_Seq
+
+### GCN Architecture Fixes (vs original deepAntigen_Seq framework)
+- **Status:** complete
+- Identified 3 discrepancies via component-by-component comparison:
+
+**Fix 1: Double GRU → Single GRU per layer**
+- Problem: TGCN had internal GRU + CrossModalGCNLayer had another GRU = 2 GRUs/layer
+- Original: only 1 GRU at step ④ (end of layer), local MP is pure MLP
+- Fix: replaced `TGCN` with `LocalMessagePassing` (already defined, unused) in `CrossModalGCNLayer`
+- `LocalMP`: pure MLP neighbor aggregation, no GRU inside
+
+**Fix 2: scatter_mean → MHA-weighted atom pooling**
+- Problem: `SuperNodeExchange` used `scatter_mean` to create super nodes
+- Original: "利用多头注意力机制对原子特征加权" — MHA-weighted pooling per molecule
+- Fix: added `_attn_pool()` with learnable query vectors (`attn_q_pep`, `attn_q_tcr`), key/value projections (`attn_k`, `attn_v`), per-molecule softmax, weighted sum
+- Gradient path verified
+
+**Fix 3: Added 5% node dropout augmentation**
+- Original: "训练阶段以 5% 概率随机丢弃节点及相连边"
+- Fix: added `DeepGCN._node_dropout()` — randomly drops nodes + filters incident edges + remaps indices
+- Applied in `DeepGCN.forward()` when `self.training=True`
+
+### Files changed (2026-05-21)
+| File | Action |
+|------|--------|
+| `gcn_components.py` | 3 fixes: LocalMP replaces TGCN, MHA pooling replaces scatter_mean, +node dropout |
+
+## Session: 2026-05-21 — Modular Refactoring + ESM-only Fixes
+
+### ESM-only Performance Debug & Fix (vs ECHO-deepantigen reference)
+- **Status:** complete
+- Identified 3 critical issues by comparing with ECHO-deepantigen source:
+  1. Cross-attention mix-then-normalize → normalize-then-mix
+  2. ESM projection bottleneck (1280→512) removed
+  3. Dropout 0.08→0.3, added cross_attn_dropout=0.3
+- Added early stopping (patience=10)
+- Aligned training params: batch_size=32, epochs=200, wd=1e-4
+- **Result: Test AUC 0.7868→0.8371 (+5.0%), F1 0.6882→0.7519 (+6.4%)**
+- Training: 91 epochs (early stop at 90), ~5 min/epoch
+
+### Modular Refactoring: Model + GCNPlugin
+- **Status:** complete
+- Goal: separate ECHO (language) and deepAntigen (physics) into two modules
+- Approach: Base Class + Plugin (option 2)
+- `model.py`: pure ESM-only, all GCN code/imports removed (260 lines)
+- `gcn_plugin.py`: GCNPlugin(Model) — inherits ESM track, adds GCN components
+- `train.py`: dynamic `ModelClass = GCNPlugin if use_graph else Model`
+- `dataset.py`, `utils.py`: unchanged
+
+### Files changed (2026-05-21)
+| File | Action |
+|------|--------|
+| `model.py` | Removed GCN imports, params, init blocks, forward branches |
+| `gcn_plugin.py` | **Created** — GCNPlugin(Model) with all GCN logic |
+| `train.py` | Dynamic ModelClass, fixed cross_attn_dropout path |
+| `attentions.py` | normalize-then-mix fix |
+| `configs/config_esm_only.yaml` | dropout, epochs, bs, wd aligned |
+| `configs/config_gcn.yaml` | same alignment |
+| `CLAUDE.md` | Full rewrite |
 
 ## Session: 2026-05-19 — Architecture Refactoring (4 major optimizations)
 

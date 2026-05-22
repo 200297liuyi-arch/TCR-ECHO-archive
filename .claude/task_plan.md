@@ -9,7 +9,7 @@
 Train a dual-track TCR-peptide binding predictor fusing ESM-2 protein language model (Track 1) with deepAntigen atom-level GCN (Track 2), achieving SOTA binding prediction on majority and zero-shot peptide sets.
 
 ## Current Phase
-Architecture Refactoring (2026-05-19) → Phase 2 re-training with optimized model
+Phase 7 complete (modular refactoring) → Ready for Phase 2 GCN re-training
 
 ## Phases
 
@@ -93,12 +93,25 @@ Architecture Refactoring (2026-05-19) → Phase 2 re-training with optimized mod
 - [x] **5e. Loss weight cosine annealing** — `model.py`, `train.py`, `config_gcn.yaml`
 - **Status:** complete
 
-### Phase 6: ESM-Only Baseline (2026-05-20) — COMPLETE
+### Phase 6: ESM-Only Baseline (2026-05-20) — COMPLETE ✅
 - [x] Create `configs/config_esm_only.yaml` — pure language track, use_gcn=false
-- [x] Train 50 epochs on Panpep data (~3 min/epoch, 9.3 GB VRAM)
-- [x] **Test AUC: 0.7868** — within 0.0046 of old ESM+GCN (0.7914)
-- [x] Establishes: ESM language model carries ~99.4% of old model's predictive power
-- [x] Confirms: GCN track was severely underutilized in old architecture (sum pool + cat fusion)
+- [x] **DEBUG 2026-05-20**: Identified 3 critical issues vs ECHO-deepantigen reference
+  1. Cross-attention: mix-then-normalize → normalize-then-mix
+  2. ESM projections removed for ESM-only (2560-dim classifier input)
+  3. Dropout 0.08→0.3, cross_attn_dropout=0.3, weight_decay 5e-5→1e-4
+- [x] **Train 91 epochs (early stop at 90), ~5 min/epoch, 13.9 GB VRAM**
+- [x] **BEST RESULT: val AUC 0.7671, Test AUC 0.8371, Acc 0.7730, F1 0.7519**
+- [x] Checkpoint: `runs/esm_only/best_model.pth`
+
+### Phase 7: Modular Refactoring (2026-05-21) — COMPLETE ✅
+- [x] Clean `model.py`: remove all GCN code/imports, pure ESM-only (260 lines)
+- [x] Create `gcn_plugin.py`: GCNPlugin(Model) with Track 2 physics
+  - Inherits ESM encoders, cross_attn, loss functions via super().__init__()
+  - Adds: AtomDeepGCN, projections (1280→512), gated fusion, aux head
+  - Replaces classifier (1280-dim input)
+- [x] Modify `train.py`: dynamic `ModelClass = GCNPlugin if use_graph else Model`
+- [x] `dataset.py`, `utils.py`, `attentions.py`: unchanged
+- **Status:** complete
 
 ### Known Defect
 - [ ] **Checkpoint save filter leaks params**: `cross_attn`, `classifier`, `gcn_aux_head` not in Stage 2 optimizer but `requires_grad=True` → saved (62MB vs expected 5MB). Fix: filter by `stage2_opt.param_groups` IDs.

@@ -1,10 +1,12 @@
 """GCN components for atom-level graph processing with cross-modal exchange.
 
-Architecture per layer:
-  ① TGCN (deepAntigen GRU message passing) — local chemical neighbourhood
-  ② SuperNodeExchange — s_pep ↔ s_tcr gated cross-molecule dialogue
-  ③ GRU update — combine (prev_state, TGCN_output + global_context)
+Architecture per layer (aligned with deepAntigen_Seq):
+  ① LocalMessagePassing (MLP-based, no GRU) — local chemical neighbourhood
+  ② SuperNodeExchange — MHA-weighted atom→super-node pooling + gated cross-molecule dialogue
+  ③ GRU update — combine (prev_state, LocalMP_output + global_context)  ← only GRU per layer
   + BatchNorm after each layer
+
+Graph augmentation: 5% node dropout during training (deepAntigen step ①).
 
 After all L layers:
   TopKPooling (all-atom scoring) → MultiHeadAttention → interaction_map [B,k,k,H]
@@ -109,28 +111,70 @@ class TGCN(MessagePassing):
 # ══════════════════════════════════════════════════════════════════════
 
 class SuperNodeExchange(nn.Module):
-    """Create super nodes via global pooling, then gated cross-attention.
+    """MHA-weighted atom→super-node pooling, then gated cross-attention.
 
-    1. Super node = scatter_mean(atom_features, batch) for each molecule
+    1. MHA-weighted pooling: learnable query attends to all atoms per molecule,
+       producing weighted-sum super nodes (replaces scatter_mean, aligns with
+       deepAntigen's "利用多头注意力机制对原子特征加权，传递给超级节点").
     2. Gate:  σ(W_g · [s_pep, s_tcr])   controls how much foreign info enters
-    3. Cross-attention between s_pep and s_tcr
-    4. Gated residual update: s_new = s + gate ⊙ attention_output
+    3. Cross-projection between s_pep and s_tcr (Linear, since 1 super-node
+       per molecule makes MHA degenerate to Linear projection).
+    4. Gated residual update: s_new = s + gate ⊙ cross_output
     5. Broadcast s_new back to each atom: s_new[batch]
     """
 
     def __init__(self, hidden_channels: int, n_heads: int = 4):
         super().__init__()
+        H = hidden_channels
+        # ── MHA atom→super-node pooling ────────────────────────────
+        self.attn_q_pep = nn.Parameter(torch.randn(1, H) / math.sqrt(H))
+        self.attn_q_tcr = nn.Parameter(torch.randn(1, H) / math.sqrt(H))
+        self.attn_k = pyg_linear.Linear(
+            H, H, weight_initializer="kaiming_uniform"
+        )
+        self.attn_v = pyg_linear.Linear(
+            H, H, weight_initializer="kaiming_uniform"
+        )
+        self.scale = math.sqrt(H)
+
+        # ── gate for cross-molecule exchange ────────────────────────
         self.gate_linear = pyg_linear.Linear(
-            2 * hidden_channels, hidden_channels,
-            weight_initializer="kaiming_uniform"
+            2 * H, H, weight_initializer="kaiming_uniform"
         )
-        # Use Linear instead of MultiheadAttention — with 1 super-node per
-        # molecule, softmax over 1 key is always 1.0, so MHA degenerates
-        # to a linear projection. Linear is strictly more efficient.
+        # Linear (not MHA): with 1 super-node per molecule, softmax
+        # over 1 key is always 1.0 — MHA degenerates to Linear.
         self.cross_proj = pyg_linear.Linear(
-            hidden_channels, hidden_channels,
-            weight_initializer="kaiming_uniform"
+            H, H, weight_initializer="kaiming_uniform"
         )
+
+    def _attn_pool(self, x, batch, q):
+        """Per-molecule MHA-weighted pooling: q attends to atoms → weighted sum.
+
+        Args:
+            x: [N, H] atom features
+            batch: [N] molecule index per atom
+            q: [1, H] learnable query
+        Returns:
+            s: [B, H] super node per molecule
+        """
+        K = self.attn_k(x)  # [N, H]
+        V = self.attn_v(x)  # [N, H]
+
+        # Attention scores per atom: q @ K_i
+        scores = (q * K).sum(dim=-1) / self.scale  # [N]
+
+        # Per-molecule softmax (numerically stable)
+        n_mols = batch.max().item() + 1
+        s_max = torch.full((n_mols,), float('-inf'), device=x.device)
+        s_max.scatter_reduce_(0, batch, scores, reduce='amax', include_self=False)
+        scores_shifted = scores - s_max[batch]
+        scores_exp = torch.exp(scores_shifted)
+        z = scatter_add(scores_exp, batch, dim=0)  # [B]
+        attn_w = scores_exp / (z[batch] + 1e-8)     # [N]
+
+        # Weighted sum: Σ α_i · V_i
+        s = scatter_add(attn_w.unsqueeze(-1) * V, batch, dim=0)  # [B, H]
+        return s
 
     def forward(self, pep_x, pep_batch, tcr_x, tcr_batch):
         """
@@ -141,11 +185,9 @@ class SuperNodeExchange(nn.Module):
         s_pep_new : [B, H]
         s_tcr_new : [B, H]
         """
-        B = pep_batch.max().item() + 1
-
-        # 1. create super nodes
-        s_pep = scatter_mean(pep_x, pep_batch, dim=0)  # [B, H]
-        s_tcr = scatter_mean(tcr_x, tcr_batch, dim=0)  # [B, H]
+        # 1. MHA-weighted atom→super-node pooling (deepAntigen step ②)
+        s_pep = self._attn_pool(pep_x, pep_batch, self.attn_q_pep)  # [B, H]
+        s_tcr = self._attn_pool(tcr_x, tcr_batch, self.attn_q_tcr)  # [B, H]
 
         # 2. gate: how much cross-molecule info to incorporate
         gate_pep = torch.sigmoid(
@@ -175,56 +217,52 @@ class SuperNodeExchange(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 
 class CrossModalGCNLayer(nn.Module):
-    """One complete GCN layer: TGCN → SuperNodeExchange → GRU.
+    """One complete GCN layer: LocalMP → Atom→SuperNode(MHA) → CrossExchange → GRU.
 
-    Per-layer computation flow (for both peptide and TCR):
+    Per-layer computation flow (aligned with deepAntigen_Seq):
 
-      ① TGCN (deepAntigen's GRU message passing)
+      ① LocalMessagePassing (MLP-based, no GRU)
          ┌─ message: MLP(concat(neighbor_j, edge_attr))
          ├─ aggregate: sum over neighbors
-         └─ update:   GRUCell(old_state, aggregated)  ← temporal smoothing
+         └─ update:   MLP(concat(aggregated, self))  ← pure MLP, no GRU
 
-      ② SuperNodeExchange (gated cross-molecule dialogue)
-         ┌─ Super node = scatter_mean(all_atom_features) per molecule
+      ② SuperNodeExchange (MHA-weighted pooling + gated cross-molecule dialogue)
+         ┌─ Atom→SuperNode: MHA-weighted pooling (replaces scatter_mean)
          ├─ Gate  = σ(W_g · [s_pep, s_tcr])            ← learned filter
          ├─ Cross-attention: s_pep (query) ⇄ s_tcr (key/value)
          └─ Broadcast: updated super node → every atom
 
-      ③ Final GRU update
-         new_state = GRUCell(prev_state, TGCN_output + global_context)
-
-      This means each atom simultaneously perceives:
-        - Its local chemical neighbourhood  (via TGCN message passing)
-        - The other molecule's global state  (via SuperNodeExchange broadcast)
+      ③ GRU update (deepAntigen step ④ — the only GRU per layer)
+         new_state = GRUCell(prev_state, LocalMP_output + global_context)
     """
 
     def __init__(self, hidden_channels: int, n_heads: int = 4):
         super().__init__()
-        # ① TGCN replaces LocalMessagePassing — adds GRU temporal smoothing
-        self.tgcn_pep = TGCN(hidden_channels)
-        self.tgcn_tcr = TGCN(hidden_channels)
+        # ① LocalMessagePassing — MLP neighbour aggregation (no GRU, aligns with deepAntigen)
+        self.local_mp_pep = LocalMessagePassing(hidden_channels)
+        self.local_mp_tcr = LocalMessagePassing(hidden_channels)
 
-        # ② super node creation + gated cross-molecule exchange
+        # ② super node: MHA-weighted atom pooling + gated cross-molecule exchange
         self.super_exchange = SuperNodeExchange(hidden_channels, n_heads)
 
-        # ③ final GRU: fuse prev_state with (TGCN_output + global_context)
+        # ③ GRU: the only temporal smoothing per layer (deepAntigen step ④)
         self.gru_pep = nn.GRUCell(hidden_channels, hidden_channels)
         self.gru_tcr = nn.GRUCell(hidden_channels, hidden_channels)
 
     def forward(self, pep_x, pep_edge_index, pep_edge_attr, pep_batch,
                 tcr_x, tcr_edge_index, tcr_edge_attr, tcr_batch):
-        # ① TGCN message passing — local chemical neighbourhood
-        pep_tgcn = self.tgcn_pep(pep_x, pep_edge_index, pep_edge_attr, pep_batch)
-        tcr_tgcn = self.tgcn_tcr(tcr_x, tcr_edge_index, tcr_edge_attr, tcr_batch)
+        # ① Local message passing — local chemical neighbourhood (no GRU)
+        pep_local = self.local_mp_pep(pep_x, pep_edge_index, pep_edge_attr)
+        tcr_local = self.local_mp_tcr(tcr_x, tcr_edge_index, tcr_edge_attr)
 
-        # ② super node creation + gated cross-molecule exchange
+        # ② MHA-weighted super node creation + gated cross-molecule exchange
         pep_global, tcr_global, s_pep, s_tcr = self.super_exchange(
-            pep_tgcn, pep_batch, tcr_tgcn, tcr_batch
+            pep_local, pep_batch, tcr_local, tcr_batch
         )
 
-        # ③ GRU update: combine prev_state + local(TGCN) + global(cross-mol)
-        pep_x_new = self.gru_pep(pep_x, pep_tgcn + pep_global)
-        tcr_x_new = self.gru_tcr(tcr_x, tcr_tgcn + tcr_global)
+        # ③ GRU update: fuse prev_state with (LocalMP_output + global_context)
+        pep_x_new = self.gru_pep(pep_x, pep_local + pep_global)
+        tcr_x_new = self.gru_tcr(tcr_x, tcr_local + tcr_global)
 
         return pep_x_new, tcr_x_new, s_pep, s_tcr
 
@@ -459,12 +497,15 @@ class MultiHeadAttention(nn.Module):
 class DeepGCN(nn.Module):
     """Cross-modal GCN for TCR–peptide atom-level interaction.
 
-    Architecture — joint encoder with per-layer cross-molecule dialogue:
+    Architecture (aligned with deepAntigen_Seq):
+
+      Graph augmentation: 5% node dropout during training
+      Initial projection: 25-dim one-hot → HS (LeakyReLU)
 
       For each of L layers:
-        ① TGCN (deepAntigen GRU message passing, pep + tcr independently)
-        ② SuperNodeExchange (s_pep ↔ s_tcr gated cross-attention)
-        ③ GRU update (prev_state → new_state with TGCN_output + global_context)
+        ① LocalMessagePassing (MLP-based, no GRU — deepAntigen step ①)
+        ② SuperNodeExchange (MHA-weight atom→super-node + gated cross-attention)
+        ③ GRU update (prev_state → new_state, the only GRU per layer — step ④)
         + BatchNorm after each layer
 
       After L layers:
@@ -538,15 +579,26 @@ class DeepGCN(nn.Module):
           interaction_map : [B, k, k, H]  ghost-masked (padded positions = 0)
         """
         # ── initial projection ───────────────────────────────────────
-        pep_x = F.leaky_relu(self.init_w_pep(peptide_graphs.x), 0.1)
-        tcr_x = F.leaky_relu(self.init_w_tcr(cdr3_graphs.x), 0.1)
-
+        pep_x = peptide_graphs.x
         pep_ei = peptide_graphs.edge_index
         pep_ea = peptide_graphs.edge_attr
         pep_batch = peptide_graphs.batch
+        tcr_x = cdr3_graphs.x
         tcr_ei = cdr3_graphs.edge_index
         tcr_ea = cdr3_graphs.edge_attr
         tcr_batch = cdr3_graphs.batch
+
+        # ── graph augmentation: 5% node dropout (deepAntigen step ①) ──
+        if self.training:
+            pep_x, pep_ei, pep_ea, pep_batch = self._node_dropout(
+                pep_x, pep_ei, pep_ea, pep_batch, drop_prob=0.05
+            )
+            tcr_x, tcr_ei, tcr_ea, tcr_batch = self._node_dropout(
+                tcr_x, tcr_ei, tcr_ea, tcr_batch, drop_prob=0.05
+            )
+
+        pep_x = F.leaky_relu(self.init_w_pep(pep_x), 0.1)
+        tcr_x = F.leaky_relu(self.init_w_tcr(tcr_x), 0.1)
 
         # ── per-layer: TGCN → SuperNodeExchange → GRU ────────────────
         for i in range(self.depth):
@@ -595,6 +647,43 @@ class DeepGCN(nn.Module):
             "joint_mask": joint_mask,             # [B, k, k, 1]
             "interaction_map": interaction_map,    # [B, k, k, H_gcn] (ghost-masked)
         }
+
+    @staticmethod
+    def _node_dropout(x, edge_index, edge_attr, batch, drop_prob=0.05):
+        """Randomly drop nodes + incident edges during training (graph augmentation).
+
+        Aligned with deepAntigen: "训练阶段以 5% 概率随机丢弃节点及相连边".
+        No-op during eval.
+        """
+        if drop_prob <= 0:
+            return x, edge_index, edge_attr, batch
+
+        n_total = x.size(0)
+        keep_mask = torch.rand(n_total, device=x.device) > drop_prob
+
+        # If all nodes would be dropped, keep at least one
+        if keep_mask.sum() == 0:
+            keep_mask[0] = True
+
+        # Filter edges: keep only edges where BOTH endpoints survive
+        src, dst = edge_index[0], edge_index[1]
+        edge_keep = keep_mask[src] & keep_mask[dst]
+
+        # Remap surviving node indices
+        old_to_new = torch.full((n_total,), -1, dtype=torch.long, device=x.device)
+        old_to_new[keep_mask] = torch.arange(keep_mask.sum(), device=x.device)
+
+        new_edge_index = torch.stack([
+            old_to_new[src[edge_keep]],
+            old_to_new[dst[edge_keep]],
+        ], dim=0)
+
+        return (
+            x[keep_mask],
+            new_edge_index,
+            edge_attr[edge_keep],
+            batch[keep_mask],
+        )
 
     def freeze_encoder(self):
         """Freeze init projections + all GCN layers + BN.

@@ -5,6 +5,37 @@
   WHEN: Update after ANY discovery. Follow the 2-Action Rule.
 -->
 
+## GCN Architecture Alignment with deepAntigen_Seq (2026-05-21)
+
+### Discovery: 3 Architectural Discrepancies vs Original
+After component-by-component comparison with the original deepAntigen_Seq framework:
+
+### Fix 1: Double GRU → Single GRU per layer
+**Symptom**: TGCN had internal `GRUCell` + CrossModalGCNLayer had another `GRUCell` = 2 GRUs per layer.
+**Original**: Only 1 GRU at step ④ (end of layer). Step ① local message passing is pure MLP (no GRU).
+**Fix**: Replaced `TGCN` → `LocalMessagePassing` in `CrossModalGCNLayer`. `LocalMessagePassing` was already defined but unused — it's the pure-MLP version of local aggregation. Layer-end GRU retained as the sole temporal smoothing per layer.
+**Files**: `gcn_components.py` (CrossModalGCNLayer)
+
+### Fix 2: scatter_mean → MHA-Weighted Atom Pooling
+**Symptom**: `SuperNodeExchange` used `scatter_mean` for super-node creation — all atoms equal weight.
+**Original**: "利用多头注意力机制对原子特征加权，传递给超级节点" — within-graph MHA pooling: learnable query attends to N atom keys, producing weighted-sum super node. (Cross-graph MHA is degenerate with 1 key — Linear is correct there.)
+**Fix**: Added `_attn_pool()` method with learnable query `attn_q_pep`/`attn_q_tcr`, key/value projections, per-molecule softmax, weighted sum via `scatter_add`. Verified gradient flow (attn_q_pep grad norm: 16.49).
+**Files**: `gcn_components.py` (SuperNodeExchange)
+
+### Fix 3: Missing Graph Augmentation (Node Dropout)
+**Symptom**: No graph data augmentation during training.
+**Original**: "训练阶段以 5% 概率随机丢弃节点及相连边"
+**Fix**: Added `DeepGCN._node_dropout()` — random 5% node masking, edge filtering (both endpoints must survive), index remapping for surviving nodes. Applied in `forward()` during training only.
+**Files**: `gcn_components.py` (DeepGCN)
+
+### Design Decisions (new)
+| Decision | Rationale |
+|----------|-----------|
+| LocalMessagePassing (not TGCN) for per-layer local aggregation | Aligns with deepAntigen step ① — pure MLP, GRU only at step ④ |
+| MHA-weighted atom→super-node pooling | Aligns with deepAntigen step ② — learnable importance weighting of atoms |
+| 5% node dropout during training | Aligns with deepAntigen graph augmentation — regularization for atom graphs |
+| Cross-graph exchange using Linear (not MHA) | Retained — with 1 super-node/molecule, MHA is degenerate; Linear is correct |
+
 ## Requirements
 - Fuse ESM-2 protein language model (Track 1) with deepAntigen atom-level GCN (Track 2)
 - Predict TCR-peptide binding — binary classification

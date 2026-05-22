@@ -8,6 +8,7 @@ import pandas as pd
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from model import Model
+from gcn_plugin import GCNPlugin
 from dataset import TCRPeptideDataset, collate_graph_batch
 from utils import save_checkpoint, compute_metrics, load_atchley, load_checkpoint
 
@@ -81,8 +82,8 @@ def train_one(cfg, epochs, run_name_suffix=""):
     # ── Model ───────────────────────────────────────────────────────
     lora_preset = cfg['lora']['presets'][cfg['esm']['encoder1']]
 
-    gcn_args = cfg.get('gcn', None)
-    model_params = {
+    # shared params for both Model and GCNPlugin
+    shared_params = {
         'esm1_name':            cfg['esm']['encoder1'],
         'esm2_name':            cfg['esm']['encoder2'],
         'use_lora':             cfg['use_lora'],
@@ -98,14 +99,20 @@ def train_one(cfg, epochs, run_name_suffix=""):
         'focal_gamma':          cfg['training']['focal_gamma'],
         'class_balance':        class_imbalance,
         'second_contrastive':   cfg['training']['second_contrastive'],
-        'use_gcn':              use_graph,
-        'gcn_args':             gcn_args,
-        'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
-        'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
         'cross_attn_dropout':   cfg['training'].get('cross_attn_dropout', 0.1),
     }
 
-    model = Model(**model_params).to(cfg.get('device', 'cpu'))
+    if use_graph:
+        gcn_args = cfg.get('gcn', None)
+        model_params = {
+            **shared_params,
+            'gcn_args':             gcn_args,
+            'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
+            'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
+        }
+        model = GCNPlugin(**model_params).to(cfg.get('device', 'cpu'))
+    else:
+        model = Model(**shared_params).to(cfg.get('device', 'cpu'))
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg['training']['lr'],
@@ -216,8 +223,17 @@ def main(config):
 
     # ── test evaluation ─────────────────────────────────────────────
     class_imbalance = 0.5
+    # peek at checkpoint config to determine model class
+    import torch as _torch
+    chk_path = os.path.join(cfg['training']['output_dir'], 'best_model.pth')
+    chk = _torch.load(chk_path, map_location='cpu', weights_only=False)
+    run_cfg = chk['config']
+    use_graph = run_cfg.get('use_gcn', False)
+    ModelClass = GCNPlugin if use_graph else Model
+    del chk, _torch
+
     model, _, run_cfg = load_checkpoint(
-        Model, cfg['training']['output_dir'], class_imbalance,
+        ModelClass, cfg['training']['output_dir'], class_imbalance,
         device=cfg.get('device', 'cpu'),
     )
     df_test = pd.read_csv(run_cfg['dataset']['test_csv'])
@@ -225,7 +241,6 @@ def main(config):
         f"facebook/{run_cfg['esm']['encoder1']}"
     )
     atchley_map = load_atchley(run_cfg.get('atchley_path'))
-    use_graph = run_cfg.get('use_gcn', False)
 
     test_ds = TCRPeptideDataset(
         df_test, tokenizer, atchley_map,
