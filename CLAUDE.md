@@ -58,7 +58,19 @@ train.py           # Dynamic ModelClass selection by config
 
 ### Pending
 - [ ] Phase 2 re-training with GCNPlugin (config_gcn.yaml ready)
-- [ ] Phase 4 zero-shot evaluation
+- [ ] GCN-only training with paper data (depth=2, crashed, need fix)
+
+### Zero-Shot Evaluation (2026-05-22)
+| Model | Train Data | Test AUC | Test Acc | Test F1 |
+|-------|-----------|----------|----------|---------|
+| **ESM-only** | PanPep 52k | **0.8148** | **0.7474** | **0.7149** |
+| GCN-only (depth=2) | PanPep 52k | 0.7445 | 0.6919 | 0.6637 |
+| GCN-only (paper-aligned) | Paper 62k | ❌ collapsed | ❌ | ❌ |
+
+### deepAntigen Paper Reference (Nature Communications 2025)
+- Paper TCR zero-shot: 0.71 (COVID), 0.84 (Gao), PanPep baseline 0.51
+- Our GCN-only 0.74 > PanPep baseline 0.51 (paper confirms PanPep is weak on zero-shot)
+- Paper training data: `test_antigenTCR/Data/sequence/train.csv` (62,446 balanced)
 
 ### Phase 2 Results (Old Architecture, pre-refactor)
 | Metric | Value |

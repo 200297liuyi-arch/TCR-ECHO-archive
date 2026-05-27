@@ -16,7 +16,7 @@ from utils import load_atchley, load_checkpoint
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 CKPT_DIR = 'runs/esm_only'
-ZERO_CSV = 'datasets/panpep/zero_dataset.csv'
+ZERO_CSV = 'datasets/echo/panpep/zero_dataset.csv'
 OUT_DIR = 'runs/esm_only'
 
 

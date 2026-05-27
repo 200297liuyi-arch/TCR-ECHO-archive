@@ -316,6 +316,119 @@ def topk(x, ratio, chems, batch):
     return perm.long(), on_index, k
 
 
+def paper_topk(x, ratio, batch):
+    """Top-k atom selection per molecule — paper-aligned minimal version.
+
+    Returns only perm (no on_index, no per-mol k values).
+    Handles molecules with < ratio atoms via min clamp.
+    """
+    num_nodes = scatter_add(batch.new_ones(x.size(0)), batch, dim=0)
+    batch_size, max_num_nodes = num_nodes.size(0), num_nodes.max().item()
+    cum_num_nodes = torch.cat(
+        [num_nodes.new_zeros(1), num_nodes.cumsum(dim=0)[:-1]], dim=0
+    )
+
+    index = torch.arange(batch.size(0), dtype=torch.long, device=x.device)
+    index = (index - cum_num_nodes[batch]) + (batch * max_num_nodes)
+
+    dense_x = x.new_full((batch_size * max_num_nodes,), torch.finfo(x.dtype).min)
+    dense_x[index] = x
+    dense_x = dense_x.view(batch_size, max_num_nodes)
+
+    _, perm = dense_x.sort(dim=-1, descending=True)
+
+    perm = perm + cum_num_nodes.view(-1, 1)
+    perm = perm.view(-1)
+
+    k = num_nodes.new_full((num_nodes.size(0),), ratio)
+    k = torch.min(k, num_nodes)
+    mask = [
+        torch.arange(k[i], dtype=torch.long, device=x.device) +
+        i * max_num_nodes for i in range(batch_size)
+    ]
+    mask = torch.cat(mask, dim=0)
+    perm = perm[mask]
+    return perm
+
+
+class PaperTopKPooling(torch.nn.Module):
+    """Paper-aligned TopK pooling — single learnable weight, no positional encoding."""
+
+    def __init__(self, in_channels: int, ratio: int = 1, nonlinearity: Callable = torch.tanh):
+        super().__init__()
+        self.in_channels = in_channels
+        self.ratio = ratio
+        self.nonlinearity = nonlinearity
+        self.weight = nn.Parameter(torch.Tensor(1, in_channels))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot(self.weight)
+
+    def forward(self, x, batch):
+        xx = x.unsqueeze(-1) if x.dim() == 1 else x
+        score = (xx * self.weight).sum(dim=-1)
+        score = self.nonlinearity(score / self.weight.norm(p=2, dim=-1))
+        perm = paper_topk(score, self.ratio, batch)
+        x_top = xx[perm] * score[perm].view(-1, 1)
+        bz = batch.max().item() + 1
+        # Handle variable k: pad to ratio if needed
+        k_list = scatter_add(batch.new_ones(score.size(0)), batch, dim=0)
+        k_per_mol = torch.min(k_list, torch.full_like(k_list, self.ratio))
+        if (k_per_mol != self.ratio).any():
+            # Some molecules have < ratio atoms — pad to ratio
+            x_parts, idx = [], 0
+            for i in range(bz):
+                ki = k_per_mol[i].item()
+                need = self.ratio - ki
+                if need > 0:
+                    x_parts.append(torch.cat([
+                        x_top[idx:idx+ki],
+                        x_top[idx:idx+ki].new_zeros(need, x_top.shape[-1]),
+                    ]))
+                else:
+                    x_parts.append(x_top[idx:idx+ki])
+                idx += ki
+            x_top = torch.stack(x_parts)
+        else:
+            x_top = x_top.view(bz, self.ratio, -1)
+        return x_top, perm
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PaperEncoder  — independent per-molecule GCN (paper architecture)
+# ══════════════════════════════════════════════════════════════════════
+
+class PaperEncoder(nn.Module):
+    """Paper-aligned independent per-molecule GCN encoder.
+
+    depth x (TGCN -> BatchNorm), TopK only at last layer.
+    No cross-modal interaction - peptide and CDR3 encoded separately.
+    """
+
+    def __init__(self, in_channels: int, hidden_channels: int, depth: int, k: int):
+        super().__init__()
+        self.init_w = pyg_linear.Linear(
+            in_channels, hidden_channels, weight_initializer='kaiming_uniform'
+        )
+        self.GCN_Depth = depth
+        self.gcn = nn.ModuleList([TGCN(hidden_channels) for _ in range(depth)])
+        self.top_K_pooling = nn.ModuleList([
+            PaperTopKPooling(hidden_channels, ratio=k) for _ in range(depth)
+        ])
+        self.bn_x = nn.ModuleList([BatchNorm(hidden_channels) for _ in range(depth)])
+
+    def forward(self, graphs):
+        x, edge_index, edge_attr, ibatch = graphs.x, graphs.edge_index, graphs.edge_attr, graphs.batch
+        x_l = F.leaky_relu(self.init_w(x), 0.1)
+        for i in range(self.GCN_Depth):
+            x_l = self.gcn[i](x_l, edge_index, edge_attr, ibatch)
+            x_l = self.bn_x[i](x_l)
+            if i == self.GCN_Depth - 1:
+                fs, perm = self.top_K_pooling[i](x_l, batch=ibatch)
+        return fs
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  PositionalEncoding
 # ══════════════════════════════════════════════════════════════════════
@@ -450,10 +563,18 @@ class TopKPooling(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int):
+    """Cross-molecule attention on top-k atom features.
+
+    output_mode:
+      'full' — returns intermap * att [B, k, k, H] (current default)
+      'sum'  — returns sum(intermap * att, dim=(1,2)) [B, H] (paper-aligned)
+    """
+
+    def __init__(self, hidden_size: int, n_heads: int, output_mode: str = 'full'):
         super().__init__()
         self.hidden_size = hidden_size
         self.n_heads = n_heads
+        self.output_mode = output_mode
         self.W_CDR3 = nn.Linear(hidden_size, hidden_size * n_heads)
         self.W_Peptide = nn.Linear(hidden_size, hidden_size * n_heads)
         self.reset_param()
@@ -487,7 +608,9 @@ class MultiHeadAttention(nn.Module):
         att = att.unsqueeze(-1)
 
         intermap = peptide.unsqueeze(-3) + cdr3.unsqueeze(-2)
-        return intermap * att  # [B, k_pep, k_cdr3, H]
+        if self.output_mode == 'sum':
+            return torch.sum(intermap * att, dim=(1, 2))
+        return intermap * att
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -626,6 +749,7 @@ class DeepGCN(nn.Module):
         interaction_map = self.peptide_cdr3_att(pep_topk, tcr_topk)
         # Kill ghost-atom contributions: padded positions → zero features
         interaction_map = interaction_map * joint_mask
+        interaction_map = self.dropout_atom(interaction_map)
 
         # ── zero out padded perms for safety ─────────────────────────
         p_perm = p_perm * p_valid.long()
@@ -720,3 +844,48 @@ class DeepGCN(nn.Module):
         """
         for p in self.parameters():
             p.requires_grad = False
+
+
+# ============================================================================
+#  PaperAlignedDeepGCN  — paper's independent encoder architecture
+# ============================================================================
+
+class PaperAlignedDeepGCN(nn.Module):
+    """Paper-aligned GCN: 2 independent encoders + final MHA only.
+
+    Architecture (pTCR_seq.py, Nature Communications 2025):
+      peptide -> PaperEncoder(depth=5, k=20) -> [B, 20, 128]
+      cdr3    -> PaperEncoder(depth=5, k=20) -> [B, 20, 128]
+      MHA(sum output) -> [B, 128]
+      Projector(128->64) + ReLU + Dropout(0.2)
+      Classifier(64->1) -> logits
+
+    No per-layer cross-modal exchange. Cross-attention only at final MHA.
+    """
+
+    def __init__(self, args: dict):
+        super().__init__()
+        HS = args['hidden_size']
+        depth = args['depth']
+        k = args['k']
+        heads = args.get('heads', 4)
+        in_channels = args.get('in_channels', 25)
+
+        self.peptide_encoder = PaperEncoder(in_channels, HS, depth, k)
+        self.cdr3_encoder = PaperEncoder(in_channels, HS, depth, k)
+        self.peptide_cdr3_att = MultiHeadAttention(HS, heads, output_mode='sum')
+        self.dropout = nn.Dropout(p=0.2)
+        self.projector = pyg_linear.Linear(
+            HS, int(0.5 * HS), weight_initializer='kaiming_uniform'
+        )
+        self.classier = pyg_linear.Linear(
+            int(0.5 * HS), 1, weight_initializer='kaiming_uniform'
+        )
+
+    def forward(self, peptide_graphs, cdr3_graphs):
+        peptide_fs = self.peptide_encoder(peptide_graphs)
+        cdr3_fs = self.cdr3_encoder(cdr3_graphs)
+        peptide_cdr3_intermap = self.peptide_cdr3_att(peptide_fs, cdr3_fs)
+        proj = F.relu(self.dropout(self.projector(peptide_cdr3_intermap)))
+        logits = self.classier(proj)
+        return logits.squeeze(-1)

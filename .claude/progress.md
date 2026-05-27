@@ -1,5 +1,132 @@
 # Progress Log
-<!-- Session log — chronological record of what was done, when, and what happened. -->
+
+## Session: 2026-05-25~27 — Paper-Aligned Independent Encoder Architecture
+
+### Paper-Aligned Architecture Implementation
+- **Status:** complete
+- Replaced per-layer SuperNodeExchange with 2 independent Encoders (paper's pTCR_seq.py)
+- New classes in `gcn_components.py`: PaperTopKPooling, PaperEncoder, PaperAlignedDeepGCN
+- MultiHeadAttention extended with `output_mode='sum'` — returns `sum(dim=(1,2))` [B,H]
+- GCNOnlyModel simplified: independent encoders → MHA → Projector(128→64)→Classifier(64→1)
+- Training config: SGD lr=1e-4 wd=0, FocalLoss(γ=2, reduction='sum'), bs=64, patience=60
+
+### 10-Fold CV Results (2026-05-27 00:01 complete, ~32.5h on 3 GPUs)
+
+| Stat | val AUC | test AUC |
+|------|---------|----------|
+| Mean | 0.7493 | 0.7499 |
+| Median | 0.7471 | 0.7515 |
+| Best | 0.7642 | 0.7824 |
+| Worst | 0.7390 | 0.7095 |
+
+### Key Changes
+- `gcn_only_train.py`: added --fold/--n-folds/--gpu/--lr args, StratifiedKFold, per-fold output
+- `run_cv.sh`: auto-launch 10 folds in batches of 3, wait + aggregate
+- Patience fixed: 150→60 (was incorrectly changed during paper refactoring)
+
+### Files changed
+| File | Action |
+|------|--------|
+| `gcn_components.py` | +PaperTopKPooling, +PaperEncoder, +PaperAlignedDeepGCN, MHA output_mode |
+| `gcn_only_train.py` | Simplified GCNOnlyModel, argparse, StratifiedKFold, wd=0, patience=60 |
+| `run_cv.sh` | Created — parallel fold launcher |
+| `docs/superpowers/specs/2026-05-25-gcn-paper-aligned-encoder-design.md` | Created |
+| `docs/superpowers/plans/2026-05-25-gcn-paper-aligned-encoder-plan.md` | Created |
+| `.claude/task_plan.md` | Phase 10 added |
+| `.claude/findings.md` | Updated |
+| `.claude/progress.md` | This update |
+
+## Session: 2026-05-25 — deepAntigen Source Comparison & GCN v2 Fix
+
+### Systematic Comparison with Original deepAntigen
+- **Status:** complete
+- Read original `pTCR_seq.py` (94 lines), `load_seq.py`, `model_utils.py`, `config_seq.ini`
+- Identified 3 critical gaps: FocalLoss, classifier capacity, encoder architecture
+- Original uses 2 independent Encoders (no per-layer cross-modal), FocalLoss(γ=2), 8K classifier
+- TCR-ECHO uses per-layer SuperNodeExchange, BCE loss, 197K classifier
+
+### P0 Fix v2 Implementation
+- **Status:** complete
+- `gcn_only_train.py`: BCEWithLogitsLoss → FocalLoss(γ=2, reduction='sum')
+- `gcn_only_train.py`: classifier_hidden 256→64 (16.5K params vs 197K)
+- `gcn_only_train.py`: LR 2e-4→1e-4, val_split 5%→10%, patience 150→60
+- Total params: 2,400,257 → 2,350,721
+- Verified: FocalLoss down-weights easy samples (Focal 0.09 vs BCE 0.99 on test input)
+
+### P0 Fix v1 Recap (2026-05-23~24)
+- dropout_atom activated + weight_decay=1e-4, BCE loss
+- Result: val AUC 0.7630, test AUC 0.7515, early stop ep309
+- Overfitting not solved — led to v2 fixes
+
+### Files changed (2026-05-25)
+| File | Action |
+|------|--------|
+| `gcn_only_train.py` | FocalLoss class, classifier 64, LR 1e-4, val 10%, patience 60 |
+| `.claude/task_plan.md` | Phase 9 added |
+| `.claude/findings.md` | Full comparison analysis + architecture table |
+| `.claude/progress.md` | This update |
+
+### Current Training (launched 2026-05-25 12:27)
+- FocalLoss(γ=2), 16.5K classifier, LR=1e-4, wd=1e-4, val=10%, patience=60
+- Train 56,201 / Val 6,245 / Test 1,714
+- Monitoring: cron job every 30 min
+
+## Session: 2026-05-22 — deepAntigen Paper Analysis & GCN-Only Benchmarking
+
+### ESM-only Zero-Shot Evaluation
+- **Status:** complete
+- Evaluated on `zero_test_paper.csv` (1,714 samples, 857+/857-)
+- **Result: Test AUC 0.8148, Acc 0.7474, F1 0.7149**
+- Only 2.2% below majority test AUC (0.8371) — strong generalization
+
+### GCN-Only Training & Paper Analysis
+- **Status:** complete (analysis), training pending
+- **GCN-only baseline (depth=2, k=10, focal loss, PanPep data)**: Test AUC 0.7445 on zero_test_paper.csv
+- Got worse when aligning MHA to per-row softmax (0.7036) — flattened softmax + focal loss + masked pool is the winning combo
+
+### deepAntigen Paper Deep-Dive
+- **Status:** complete
+- Paper: Que, Xue, Wang et al., Nature Communications 16, 5171 (2025)
+- Paper config: depth=5, k=20, hidden=128, SGD lr=1e-4, bs=32, epochs=700, momentum=0.9
+- Paper TCR zero-shot: 0.71 (COVID-19), ~0.84 (Gao dataset), PanPep baseline=0.51
+- Paper training data: 62,446 samples (balanced) from IEDB+VDJdb+PIRD+McPAS+ImmuneCODE+NeoTCR
+
+### Key Finding: Architecture Incompatibility
+- Paper's deepAntigen: **2 independent encoders**, cross-attention only at final MHA
+- Our GCN: **per-layer SuperNodeExchange** (cross-modal dialogue at every layer)
+- depth=5 with per-layer cross-modal exchange → gradient collapse (train_loss→0.001)
+- Our architecture works at depth=2, but paper's 5-layer config is incompatible
+- Our per-layer cross-modal exchange is a design improvement over paper, but limits max depth
+
+### Original Paper Training Data Located
+- Found at `/home/lyf/projects/deepAntigen/test_antigenTCR/Data/sequence/train.csv` (62,446 samples)
+- Test: `zero-shot_sample.csv` (1,714 samples, same as zero_test_paper.csv)
+- Graphs precomputed for paper data: +31,300 new graphs added to cache
+- `precompute_paper_graphs.py` created for this purpose
+
+### Files changed (2026-05-22)
+| File | Action |
+|------|--------|
+| `zero_shot_eval.py` | **Created** — ESM-only zero-shot evaluation script |
+| `gcn_only_train.py` | **Created** — standalone GCN training script, supports paper data |
+| `gcn_components.py` | MHA softmax: flattened→per-row→reverted to flattened (flattened wins) |
+| `utils.py` | Fixed `load_checkpoint` to not pass `use_gcn`/`gcn_args` to Model |
+| `precompute_paper_graphs.py` | **Created** — builds graphs for paper's training data |
+| `.claude/progress.md` | This update |
+| `.claude/findings.md` | Paper analysis + architecture findings |
+| `.claude/task_plan.md` | Updated phases |
+
+### Performance Summary
+| Model | Train Data | Zero-Shot Test AUC | Zero-Shot Acc |
+|-------|-----------|-------------------|---------------|
+| ESM-only | PanPep 52k | 0.8148 | 0.7474 |
+| GCN-only (depth=2) | PanPep 52k | 0.7445 | 0.6919 |
+| GCN-only (depth=5) | Paper 62k | ❌ collapsed | ❌ |
+
+### Pending
+- [ ] GCN-only training with paper data (stable depth=2 config) — training crashed, need fix
+- [ ] ESM+GCN joint training (gcn_plugin.py)
+- [ ] COVID-19 zero-shot evaluation (paper's 1.1M test set)
 
 ## Session: 2026-05-21 — GCN Architecture Alignment with deepAntigen_Seq
 

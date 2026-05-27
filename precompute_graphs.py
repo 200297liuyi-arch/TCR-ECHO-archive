@@ -66,8 +66,8 @@ def precompute(csv_path, cache_dir, tcr_col="binding_TCR", pep_col="peptide"):
 
 
 if __name__ == "__main__":
-    base = "datasets/panpep"
-    cache = "datasets/panpep/graph_cache"
+    base = "datasets/echo/panpep"
+    cache = "datasets/echo/panpep/graph_cache"
 
     for split in ["train_joint", "val_joint", "majority_testing_dataset"]:
         path = os.path.join(base, f"{split}.csv")

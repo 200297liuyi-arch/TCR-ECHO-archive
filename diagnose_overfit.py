@@ -15,7 +15,7 @@ from deepAntigen_Seq.load_dataset.load_seq import pTCR_DataSet, collate
 from deepAntigen_Seq.networks.top_k_pooling_seq import TopKPooling
 
 device = torch.device('cuda')
-csv_path = 'datasets/panpep/train_joint.csv'
+csv_path = 'datasets/echo/panpep/train_joint.csv'
 full_ds = pTCR_DataSet(csv_path, aug=False, test=True)
 
 # Make a minimal 32-sample batch

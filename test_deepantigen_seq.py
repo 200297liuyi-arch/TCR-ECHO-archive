@@ -22,8 +22,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
 
 # ── Data: use train_joint.csv, tiny subset ──────────────────────────
-csv_path = 'datasets/panpep/train_joint.csv'
-cache_dir = 'datasets/panpep/graph_cache'
+csv_path = 'datasets/echo/panpep/train_joint.csv'
+cache_dir = 'datasets/echo/panpep/graph_cache'
 full_ds = pTCR_DataSet(csv_path, aug=False, test=True)
 
 # ── Model args ──────────────────────────────────────────────────────

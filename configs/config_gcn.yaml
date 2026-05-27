@@ -13,11 +13,11 @@ dataset:
     label: label
     peptide: peptide
     tcr: binding_TCR
-  test_csv: datasets/panpep/majority_testing_dataset.csv
-  train_csv: datasets/panpep/train_joint.csv
-  val_csv: datasets/panpep/val_joint.csv
+  test_csv: datasets/echo/panpep/majority_testing_dataset.csv
+  train_csv: datasets/echo/panpep/train_joint.csv
+  val_csv: datasets/echo/panpep/val_joint.csv
 
-graph_cache_dir: datasets/panpep/graph_cache     # precomputed pickle cache
+graph_cache_dir: datasets/echo/panpep/graph_cache     # precomputed pickle cache
 
 esm:
   encoder1: esm2_t33_650M_UR50D

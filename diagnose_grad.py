@@ -11,7 +11,7 @@ from deepAntigen_Seq.load_dataset.load_seq import pTCR_DataSet, collate
 from deepAntigen_Seq.networks.pTCR_seq import DeepGCN
 
 device = torch.device('cuda')
-csv_path = 'datasets/panpep/train_joint.csv'
+csv_path = 'datasets/echo/panpep/train_joint.csv'
 full_ds = pTCR_DataSet(csv_path, aug=False, test=True)
 
 args = {'hidden_size': 128, 'depth': 2, 'k': 10, 'heads': 4}

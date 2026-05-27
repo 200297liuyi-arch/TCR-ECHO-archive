@@ -9,7 +9,44 @@
 Train a dual-track TCR-peptide binding predictor fusing ESM-2 protein language model (Track 1) with deepAntigen atom-level GCN (Track 2), achieving SOTA binding prediction on majority and zero-shot peptide sets.
 
 ## Current Phase
-Phase 7 complete (modular refactoring) → Ready for Phase 2 GCN re-training
+Phase 10: GCN-Only Paper-Aligned Encoder — 10-Fold CV COMPLETE (2026-05-27)
+
+### Phase 10: Paper-Aligned Independent Encoder + 10-Fold CV (2026-05-25~27) — COMPLETE ✅
+- [x] **Root cause confirmed**: per-layer SuperNodeExchange incompatible with depth=5 → train_loss stuck
+- [x] **Paper-aligned architecture implemented** (2026-05-25):
+  - `PaperTopKPooling`, `PaperEncoder`, `PaperAlignedDeepGCN` added to `gcn_components.py`
+  - `MultiHeadAttention` extended with `output_mode='sum'` (paper's `sum(dim=(1,2))`)
+  - `GCNOnlyModel` simplified: independent encoders + MHA → Projector(128→64)→Classifier(64→1)
+  - Params: 1,649,793 (vs old 2,350,721, -30%)
+- [x] **Training config**: SGD lr=1e-4 wd=0 momentum=0.9, FocalLoss(γ=2, reduction='sum'), bs=64, patience=60, step LR@200,400
+- [x] **10-fold CV on 3 GPUs** (2026-05-25 15:32 ~ 2026-05-27 00:01, ~32.5h total)
+  - Mean val AUC: 0.7493, Mean test AUC: 0.7499
+  - Best test AUC: 0.7824 (fold 5), Best val AUC: 0.7642 (fold 4)
+  - All folds triggered early stopping (no NaN, no collapse)
+- **Status:** complete — GCN-only mean test AUC 0.75, between paper's COVID (0.71) and Gao (0.84)
+
+### Phase 9: GCN-Only Architecture Alignment (2026-05-24~25) — COMPLETE ✅
+- [x] Root cause analysis: systematic comparison with deepAntigen original `pTCR_seq.py`
+- [x] P0 fix v1: dropout_atom + weight_decay → val AUC 0.7630, test AUC 0.7515 (overfitting)
+- [x] P0 fix v2: FocalLoss + small classifier → train_loss stuck at 0.69 AUC — architecture bottleneck confirmed
+- **Status:** superseded by Phase 10 (paper-aligned encoder)
+
+### Phase 8: GCN-Only Benchmarking & Paper Analysis (2026-05-22~23) — COMPLETE ✅
+- [x] ESM-only zero-shot evaluation: Test AUC 0.8148
+- [x] GCN-only baseline (depth=2, PanPep data): Test AUC 0.7445
+- [x] MHA softmax comparison: flattened (0.7445) > per-row (0.7036)
+- [x] deepAntigen paper analysis — architecture, config, training data all differ
+- [x] Paper training data located + graphs precomputed
+- [x] **GCN-only v1 (FocalLoss, lr=1e-4, gamma=0.1, bs=32)**: 415 epochs, best val_auc=0.6194 — poor
+- [x] **Root cause analysis**: compared with working reference `ECHO-deepantigen/deepAntigen_Seq`
+  - Loss: FocalLoss→BCEWithLogitsLoss(reduction='sum')
+  - lr: 1e-4→2e-4, lr_decay: 0.1→0.5
+  - bs: 32→64, removed grad clipping
+  - Architecture difference: reference uses independent TGCN encoders + end-only cross-attention; we use cross-modal SuperNodeExchange at every layer
+- [x] **GCN-only v2 (BCE+lr fix)**: 214 epochs, best val_auc=**0.7657** (epoch 153), stopped at overfitting plateau
+- [x] Datasets reorganized: `datasets/echo/` (ECHO) + `datasets/deepantigen/` (paper)
+- [ ] COVID-19 zero-shot evaluation (optional, 1.1M pairs)
+- **Status:** complete — GCN-only ceiling ~0.77, ESM-only 0.81 remains superior
 
 ## Phases
 
@@ -155,6 +192,8 @@ Phase 7 complete (modular refactoring) → Ready for Phase 2 GCN re-training
 
 ## Errors Encountered (cumulative)
 | # | Error | Attempt | Resolution |
+|---|-------|---------|------------|
+| 24 | GCN overfitting (val AUC plateaus ~ep150, train_loss continues -60%) | 3 | (1) dropout_atom + wd, (2) FocalLoss + small classifier + low LR + 10% val |
 |---|-------|---------|------------|
 | 1 | `roc_auc_score` on 0 samples (val set empty) | 1 | Regenerated `val_joint.csv` from 85/15 split |
 | 2 | `NameError: name 'os' is not defined` | 1 | Added `import os` to dataset.py |

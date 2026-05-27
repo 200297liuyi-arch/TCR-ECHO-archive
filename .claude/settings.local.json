@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ps *)",
+      "Bash(nvidia-smi *)",
+      "Bash(tail *)",
+      "Bash(grep *)",
+      "Bash(cat *)",
+      "Bash(echo *)",
+      "Bash(wc *)",
+      "Bash(for *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(head *)",
+      "Bash(awk *)",
+      "Bash(sed *)",
+      "Read(/home/lyf/projects/TCR-ECHO/runs/gcn_only/*)",
+      "Read(/home/lyf/projects/TCR-ECHO/.claude/*)",
+      "WebSearch",
+      "WebFetch"
+    ]
+  }
+}

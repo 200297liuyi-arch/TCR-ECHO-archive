@@ -1,9 +1,140 @@
 # Findings & Decisions
+
+## Paper-Aligned Independent Encoder — 10-Fold CV Results (2026-05-27)
+
+### Architecture Decision: Independent Encoders > Per-Layer SuperNodeExchange
+- Per-layer cross-modal exchange (SuperNodeExchange) at depth=5 → gradient stagnation (train_loss barely moves)
+- Paper's 2 independent TGCN Encoders + final MHA only → stable convergence at depth=5
+- Epoch 1 val_auc jumped from 0.50 (old) to 0.66 (paper-aligned) — architecture was the bottleneck
+- Implemented in `gcn_components.py`: PaperEncoder (TGCN×5→BN→TopK@last), PaperAlignedDeepGCN
+
+### GCN-Only 10-Fold CV Performance (zero_test_paper.csv, 1714 samples)
+- Mean test AUC: 0.7499 ± 0.024
+- Best: 0.7824, Worst: 0.7095
+- Between paper's COVID-19 (0.71) and Gao (0.84) zero-shot results
+- ESM-only baseline (0.8148) still superior — GCN provides complementary signal, not standalone
+
+### Training Dynamics
+- FocalLoss(γ=2) inherently slows convergence (down-weights easy samples)
+- SGD+momentum converges but slowly — paper compensates with 700 epochs
+- Step LR@200,400 helps break plateaus
+- ~80 sec/epoch on RTX 5090, early stopping at patience=60 typically around epoch 200-500
+- Mean epochs to convergence: ~350
+
+## deepAntigen vs TCR-ECHO GCN Systematic Comparison (2026-05-25)
+
+### Source Code Analysis
+Compared `/home/lyf/projects/deepAntigen/deepAntigen/antigenTCR/networks/pTCR_seq.py` (94 lines) vs TCR-ECHO `gcn_components.py` (730 lines) + `gcn_only_train.py`.
+
+### 3 Critical Differences Explaining Performance Gap
+
+**1. Loss Function: FocalLoss(γ=2) vs BCEWithLogitsLoss**
+- Original: `FocalLoss(gamma=2, reduction='sum')` — easy samples get weight (1-p_t)^2. Confident correct prediction (p=0.95) → weight=0.0025.
+- TCR-ECHO: `BCEWithLogitsLoss(reduction='sum')` — all samples equal weight.
+- Impact: FocalLoss is a built-in regularizer; BCE forces model to overfit easy samples.
+
+**2. Classifier Capacity: 8K vs 197K (24× difference)**
+- Original: `MHA-output [B,128] → Projector(128→64) → ReLU → Dropout(0.2) → Classifier(64→2) → Softmax` = ~8,320 params.
+- TCR-ECHO: `F_spatial [B,256] → spatial_proj(256→256×2) → LayerNorm → Dropout(0.3) → Classifier(256→256→1)` = ~197K params.
+- Impact: GCN already extracts rich features; large classifier head is overfitting backdoor.
+
+**3. Encoder Architecture: Independent vs Per-Layer Cross-Modal**
+- Original: 2 completely independent `Encoder` modules (peptide_encoder, cdr3_encoder). Each: 5× TGCN(GRU) → BN. Cross-modal interaction ONLY at final MHA. TopK pooling only at last layer.
+- TCR-ECHO: Per-layer `CrossModalGCNLayer`: LocalMP → SuperNodeExchange(MHA-pool+gate+cross-proj) → GRU → BN. Cross-modal dialogue at EVERY layer.
+- Impact: SuperNodeExchange creates richer features but also more overfitting risk at depth=5.
+
+### Architecture Details (Original)
+| Component | Original deepAntigen | TCR-ECHO |
+|-----------|---------------------|----------|
+| Per-layer local agg | TGCN (message_w + update_w + GRUCell) | LocalMessagePassing (pure MLP, no GRU) |
+| Per-layer GRU | Inside TGCN | At end of CrossModalGCNLayer (after LocalMP + SuperNodeExchange) |
+| Cross-modal | Final MHA only | Every layer via SuperNodeExchange |
+| Atom→super-node | scatter_mean (N/O-biased TopK) | MHA-weighted pooling (_attn_pool) |
+| MHA output | `sum(intermap * att, dim=(1,2))` → [B,128] | Full interaction_map [B,k,k,H] → masked max/avg pool → [B,256] |
+| Node dropout | 5% in dataset __getitem__ | 5% in DeepGCN.forward() |
+| GCN dropout | Dropout(0.2) on [B,128] MHA output | Dropout(0.2) on [B,k,k,H] interaction_map |
+| Optimizer | SGD lr=1e-4, momentum=0.9, wd=0 | SGD lr=1e-4, momentum=0.9, wd=1e-4 |
+| LR schedule | Step@200,400 ×0.5 | MultiStepLR@200,400 ×0.5 |
+| Epochs | 700 | 700 |
+| Val split | 10% (StratifiedKFold) | 10% (random split, seed=42) |
+
+### P0 Fix v1 Results (2026-05-23~24)
+- dropout_atom activated + weight_decay=1e-4
+- BCE loss, LR=2e-4, classifier 256, val 5%
+- Best val AUC: 0.7630 (ep163), Test AUC: 0.7515
+- Early stopping at ep309 (patience=150)
+- **Overfitting persisted**: train_loss dropped 68% while val_auc stagnated 146 epochs
+
+### P0 Fix v2 (2026-05-25) — Training in Progress
+- FocalLoss(γ=2) + classifier 256→64 (16.5K params) + LR 1e-4 + val 10%
+- Total params reduced from 2,400,257 → 2,350,721
+- patience=60
+
+### Design Decisions (new)
+| Decision | Rationale |
+|----------|-----------|
+| FocalLoss > BCE for GCN-only | Paper's core regularizer — down-weights easy samples |
+| Classifier 256→64 | Align with paper's tiny head (8K); GCN features are already rich |
+| LR 2e-4→1e-4 | Paper config; slower convergence reduces overfitting |
+| Val 5%→10% | Paper's StratifiedKFold 10%; more stable val_auc with 6K samples |
+| Keep weight_decay=1e-4 | Paper has wd=0 but FocalLoss provides implicit regularization; wd as extra guard |
+| Keep SuperNodeExchange | Intentional architecture improvement over paper; regularization fixes should suffice |
 <!--
   WHAT: Knowledge base for TCR-ECHO. Stores all discoveries, decisions, and research.
   WHY: Context windows are limited. This file is external memory — persistent and unlimited.
   WHEN: Update after ANY discovery. Follow the 2-Action Rule.
 -->
+
+## deepAntigen Paper Analysis (2026-05-22)
+
+### Paper Reference
+Que, Xue, Wang et al. "Identifying T cell antigen at the atomic level with graph convolutional network." Nature Communications 16, 5171 (2025).
+
+### Paper Architecture vs Ours
+| Component | Paper deepAntigen | TCR-ECHO GCN |
+|-----------|------------------|--------------|
+| Encoder structure | 2 independent Encoders, no cross-talk during encoding | Per-layer SuperNodeExchange (cross-modal dialogue every layer) |
+| Cross-molecule interaction | Only at final MHA | At every GCN layer + final MHA |
+| GRU placement | Inside TGCN (after local MP) | At end of CrossModalGCNLayer (after local MP + global context) |
+| MHA output | sum(dim=(1,2)) → [B,H] | Full [B,k,k,H] interaction map → masked pool |
+| MHA attention | Per-row softmax + mask in softmax | Flattened softmax + external joint_mask |
+
+### Paper Training Config (test_antigenTCR/config_seq.ini)
+- depth=5, k=20, heads=4, hidden=128
+- Optimizer: SGD, lr=1e-4, momentum=0.9, weight_decay=0
+- batch_size=32, epochs=700
+- Step LR decay @200,400 (×0.5)
+- Training data: 62,446 samples (31,223 pos/neg, balanced)
+- Data sources: IEDB, VDJdb, PIRD, McPAS-TCR, ImmuneCODE, NeoTCR
+
+### Paper Reported Performance (TCR Zero-Shot)
+- COVID-19 dataset: AUROC=0.71, AUPR=0.75
+- PanPep baseline: AUROC=0.51 (!!)
+- Gao et al. dataset: AUROC≈0.84
+- Our GCN-only: 0.7445 (better than PanPep 0.51, between paper's 0.71 and 0.84)
+
+### Key Finding: MHA Softmax — Flattened > Per-Row for Our Architecture
+- Per-row softmax (paper-aligned): Test AUC 0.7036
+- Flattened softmax (original): Test AUC 0.7445
+- Flattened softmax works better with full interaction map + masked pool
+- Per-row softmax is designed for sum(dim=(1,2)) output, not compatible with our architecture
+
+### Key Finding: Depth=5 + Per-Layer Cross-Modal Exchange = Gradient Collapse
+- Paper's 5 independent layers work because encoders don't cross-talk
+- Our per-layer SuperNodeExchange at depth=5 → gradient collapse (train_loss→0.001)
+- depth=2 is stable with our architecture; deeper layers need gradient stabilization
+
+### Key Finding: Paper's Training Data ≠ PanPep
+- Paper compiled 62k TCR pairs from 6 databases
+- Located at `/home/lyf/projects/deepAntigen/test_antigenTCR/Data/sequence/train.csv`
+- Our graph cache built for this data (+31,300 new graphs)
+- COVID-19 test set (1.1M pairs) also available but not yet evaluated
+
+### Design Decision: Our GCN Architecture is Fundamentally Different
+Our per-layer SuperNodeExchange is an intentional improvement, not a bug. Trade-offs:
+- **Pros**: Richer cross-modal information flow, better gradient pathways
+- **Cons**: Limits max depth (2 works, 5 crashes), harder to train from scratch
+- **Verdict**: Keep it — ESM+GCN fusion expects rich per-layer features
 
 ## GCN Architecture Alignment with deepAntigen_Seq (2026-05-21)
 
