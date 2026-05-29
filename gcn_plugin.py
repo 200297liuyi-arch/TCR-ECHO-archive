@@ -162,6 +162,64 @@ class GCNPlugin(Model):
         # ── GCN loss weight ───────────────────────────────────────────
         self.lambda_gcn_aux = lambda_gcn_aux
 
+    def _build_gcn_attn_bias(self, interaction_map, p_perm, c_perm,
+                              p_valid, c_valid, tcr_a2r, pep_a2r,
+                              L_tcr, L_pep):
+        """Build residue-level attention bias from GCN atom-level interaction.
+
+        interaction_map: [B, k, k, H]   atom-level cross-modal features (ghost-masked)
+        p_perm:         [B, k]         peptide selected atom local indices
+        c_perm:         [B, k]         TCR selected atom local indices
+        p_valid:        [B, k]         1=real peptide atom, 0=ghost
+        c_valid:        [B, k]         1=real TCR atom, 0=ghost
+        tcr_a2r:        list[Tensor]   per-sample atom→residue mapping
+        pep_a2r:        list[Tensor]
+        L_tcr:          int            max TCR residues in batch
+        L_pep:          int            max peptide residues in batch
+
+        Returns: [B, num_heads, L_tcr, L_pep]
+        """
+        B, K, _, H = interaction_map.shape
+        num_heads = self.gcn_bias_proj.out_features  # 8
+
+        # 1. Project: [B, k, k, H] → [B, k, k, 8]
+        feat = self.gcn_bias_proj(interaction_map)
+
+        # 2. Scale: / sqrt(H) × τ
+        feat = feat / (H ** 0.5) * self.gcn_bias_temp
+
+        # 3. Per-sample A2R scatter_max into residue-level
+        bias_list = []
+        for i in range(B):
+            tcr_map = tcr_a2r[i]   # [n_tcr_atoms] → residue_idx per atom
+            pep_map = pep_a2r[i]   # [n_pep_atoms]
+
+            tcr_res = tcr_map[c_perm[i].long()]   # [k] residue idx for selected atoms
+            pep_res = pep_map[p_perm[i].long()]   # [k]
+
+            pv = p_valid[i].bool()   # [k]
+            cv = c_valid[i].bool()   # [k]
+            pair_valid = cv[:, None] & pv[None, :]  # [k, k] valid atom pairs
+
+            feat_i = feat[i]  # [k, k, 8]
+            bias_i = torch.zeros(L_tcr, L_pep, num_heads,
+                                 device=feat.device, dtype=feat.dtype)
+
+            # Only process valid atom pairs
+            valid_indices = pair_valid.nonzero(as_tuple=False)  # [N_valid, 2]
+            for idx in range(valid_indices.size(0)):
+                a_tcr, a_pep = valid_indices[idx]
+                r_tcr = tcr_res[a_tcr].item()
+                r_pep = pep_res[a_pep].item()
+                if r_tcr < L_tcr and r_pep < L_pep:
+                    bias_i[r_tcr, r_pep] = torch.max(
+                        bias_i[r_tcr, r_pep], feat_i[a_tcr, a_pep]
+                    )
+
+            bias_list.append(bias_i.permute(2, 0, 1))  # [8, L_tcr, L_pep]
+
+        return torch.stack(bias_list)  # [B, 8, L_tcr, L_pep]
+
     def forward(
         self,
         inp1, mask1,
