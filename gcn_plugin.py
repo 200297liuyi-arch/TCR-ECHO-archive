@@ -202,20 +202,32 @@ class GCNPlugin(Model):
             pair_valid = cv[:, None] & pv[None, :]  # [k, k] valid atom pairs
 
             feat_i = feat[i]  # [k, k, 8]
-            bias_i = torch.zeros(L_tcr, L_pep, num_heads,
-                                 device=feat.device, dtype=feat.dtype)
+            bias_i_flat = torch.full(
+                (L_tcr * L_pep, num_heads),
+                float('-inf'), device=feat.device, dtype=feat.dtype,
+            )
 
-            # Only process valid atom pairs
-            valid_indices = pair_valid.nonzero(as_tuple=False)  # [N_valid, 2]
-            for idx in range(valid_indices.size(0)):
-                a_tcr, a_pep = valid_indices[idx]
-                r_tcr = tcr_res[a_tcr].item()
-                r_pep = pep_res[a_pep].item()
-                if r_tcr < L_tcr and r_pep < L_pep:
-                    bias_i[r_tcr, r_pep] = torch.max(
-                        bias_i[r_tcr, r_pep], feat_i[a_tcr, a_pep]
-                    )
+            # Collect valid atom→residue indices and features
+            valid_mask = pair_valid & (tcr_res.unsqueeze(1) < L_tcr) & (pep_res.unsqueeze(0) < L_pep)
+            valid_idx = valid_mask.nonzero(as_tuple=False)  # [N_valid, 2]
+            if valid_idx.size(0) > 0:
+                a_tcr_idx = valid_idx[:, 0]
+                a_pep_idx = valid_idx[:, 1]
+                r_tcr_idx = tcr_res[a_tcr_idx]  # [N_valid]
+                r_pep_idx = pep_res[a_pep_idx]  # [N_valid]
+                flat_idx = r_tcr_idx * L_pep + r_pep_idx  # [N_valid]
+                flat_feat = feat_i[a_tcr_idx, a_pep_idx]  # [N_valid, 8]
+                bias_i_flat.scatter_reduce_(
+                    0,
+                    flat_idx.unsqueeze(-1).expand(-1, num_heads),
+                    flat_feat,
+                    reduce='amax',
+                    include_self=False,
+                )
 
+            # Replace -inf (no atom mapping) with 0.0
+            bias_i_flat = torch.nan_to_num(bias_i_flat, nan=0.0, neginf=0.0)
+            bias_i = bias_i_flat.view(L_tcr, L_pep, num_heads)
             bias_list.append(bias_i.permute(2, 0, 1))  # [8, L_tcr, L_pep]
 
         return torch.stack(bias_list)  # [B, 8, L_tcr, L_pep]
