@@ -191,8 +191,8 @@ class GCNPlugin(Model):
         # 3. Per-sample A2R scatter_max into residue-level
         bias_list = []
         for i in range(B):
-            tcr_map = tcr_a2r[i]   # [n_tcr_atoms] → residue_idx per atom
-            pep_map = pep_a2r[i]   # [n_pep_atoms]
+            tcr_map = tcr_a2r[i].to(feat.device)   # [n_tcr_atoms] → residue_idx per atom
+            pep_map = pep_a2r[i].to(feat.device)   # [n_pep_atoms]
 
             tcr_res = tcr_map[c_perm[i].long()]   # [k] residue idx for selected atoms
             pep_res = pep_map[p_perm[i].long()]   # [k]
@@ -260,6 +260,7 @@ class GCNPlugin(Model):
         #  Track 2 (Physics): Atom GCN → F_spatial
         # ══════════════════════════════════════════════════════════════
         F_spatial = None
+        gcn_bias = None
 
         if tcr_graphs is not None:
             pep_batch = Batch.from_data_list(pep_graphs).to(tcr_enc.device)
@@ -269,6 +270,15 @@ class GCNPlugin(Model):
 
             interaction_map = gcn_out["interaction_map"]  # [B, k, k, H_gcn]
             joint_mask = gcn_out["joint_mask"]            # [B, k, k, 1]
+
+            # ── Build GCN attention bias ──────────────────────────────
+            gcn_bias = self._build_gcn_attn_bias(
+                interaction_map,
+                gcn_out["p_perm"], gcn_out["c_perm"],
+                gcn_out["p_valid"], gcn_out["c_valid"],
+                tcr_a2r, pep_a2r,
+                L_tcr=tcr_enc.size(1), L_pep=pep_enc.size(1),
+            )
 
             B_gcn, K, _, H_gcn_local = interaction_map.shape
             flat_map = interaction_map.view(B_gcn, K * K, H_gcn_local)
@@ -298,6 +308,7 @@ class GCNPlugin(Model):
         # ══════════════════════════════════════════════════════════════
         tcr_att, pep_att = self.cross_attn(
             tcr_enc, pep_enc, atchley1, atchley2,
+            gcn_bias=gcn_bias,
         )
 
         tcr_pool = tcr_att.mean(dim=1)
