@@ -103,6 +103,10 @@ class GCNPlugin(Model):
         })
         self.gcn_spatial_dropout = nn.Dropout(0.2)
 
+        # ── GCN attention bias: project interaction_map → attention logit space ──
+        self.gcn_bias_proj = nn.Linear(self.gcn_hidden, num_heads)  # 128 → 8
+        self.gcn_bias_temp = nn.Parameter(torch.tensor(0.1))
+
         # ── GCN auxiliary classifier ──────────────────────────────────
         self.gcn_aux_head = nn.Sequential(
             nn.Linear(spatial_in, self.gcn_hidden // 2),
@@ -123,15 +127,14 @@ class GCNPlugin(Model):
         )
 
         # ── Cross-Modal Gating ────────────────────────────────────────
-        # Decoupled language gate
+        # Decoupled language gate (residual: feat * (1+gate), floor=100%)
         lang_gate_in = proj_dim * 2  # 1024
         lang_gate_mid = 256
-        self.gate_lang = nn.Sequential(
-            nn.Linear(lang_gate_in, lang_gate_mid),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(lang_gate_mid, lang_gate_in),
-        )
+        self.gate_lang_fc1 = nn.Linear(lang_gate_in, lang_gate_mid)
+        self.gate_lang_fc2 = nn.Linear(lang_gate_mid, lang_gate_in)
+        self.gate_lang_drop = nn.Dropout(dropout)
+        # Bias init: start with gate ~0.82, so effective multiplier ~1.82
+        nn.init.constant_(self.gate_lang_fc2.bias, 1.5)
 
         # Cross-modal physics gate: language context → physics gate
         self.ctx_lang_proj = nn.Sequential(
@@ -255,13 +258,14 @@ class GCNPlugin(Model):
         #  Cross-Modal Gated Fusion
         # ══════════════════════════════════════════════════════════════
         if F_spatial is not None:
-            # Decoupled language gating
+            # Decoupled language gating — residual: feat * (1 + sigmoid(gate))
             h_lang = torch.cat([tcr_feat, pep_feat], dim=-1)
-            W_joint = torch.sigmoid(self.gate_lang(h_lang))
+            g = self.gate_lang_fc2(torch.relu(self.gate_lang_drop(self.gate_lang_fc1(h_lang))))
+            W_joint = torch.sigmoid(g)
             W_tcr, W_pep = torch.split(W_joint, 512, dim=-1)
 
-            gated_tcr = W_tcr * tcr_feat
-            gated_pep = W_pep * pep_feat
+            gated_tcr = tcr_feat * (1.0 + W_tcr)
+            gated_pep = pep_feat * (1.0 + W_pep)
 
             # Cross-modal physics gating
             ctx_lang = (tcr_feat + pep_feat) / 2
@@ -272,7 +276,11 @@ class GCNPlugin(Model):
 
             fused = torch.cat([gated_tcr, gated_pep, gated_phys], dim=-1)
         else:
-            fused = torch.cat([tcr_feat, pep_feat], dim=-1)
+            phys_placeholder = torch.zeros(
+                tcr_feat.size(0), self.gcn_hidden * 2,
+                device=tcr_feat.device, dtype=tcr_feat.dtype,
+            )
+            fused = torch.cat([tcr_feat, pep_feat, phys_placeholder], dim=-1)
 
         logits = self.classifier(self.dropout(fused)).squeeze(-1)
 
