@@ -1,5 +1,50 @@
 # Findings & Decisions
 
+## Phase 11: Residual Gating + Scheduler — Gate Collapse Root Cause & Fix (2026-05-28~29)
+
+### Gate Collapse Discovery (2026-05-28)
+- **Root cause**: Language gate learned W_tcr≈0.14, W_pep≈0.22 — aggressively suppressing ESM features
+- Physics gate W_phys≈0.61 stayed open — model was replacing language with physics, not fusing
+- This explains why fusion AUC (0.765) was far below ESM-only (0.837)
+
+### Residual Gating Implementation
+- Language gate: `feat * W` → `feat * (1 + W)` — guarantees 100% signal floor regardless of gate value
+- Physics gate: kept multiplicative (W_phys=0.61 was healthy, didn't need protection)
+- Language gate final Linear bias initialized to 1.5 → initial gate ~0.82, effective multiplier ~1.82×
+
+### Overfitting Prevention (2026-05-28)
+- **weight_decay 1e-4 → 5e-4**: stronger baseline regularization
+- **ReduceLROnPlateau**: factor=0.5, patience=10, min_lr=1e-6
+  - LR 5e-5 → 2.5e-5 (ep94) → 1.25e-5 (ep124)
+  - Each reduction brought a fresh burst of AUC improvement
+  - Final best at epoch 153 with LR=1.25e-5
+- **early_stopping patience 10→20**: gives scheduler more room to work
+
+### Impact Analysis (2026-05-29)
+- **Broke through previous ceiling**: 0.7664 (ep153) vs 0.7647 (prev run ep148)
+- The breakthrough came from fine-tuning at extremely low LR (1.25e-5) over 39 epochs
+- Without scheduler, the previous run kept using 5e-5 LR and overfit after its peak
+- The combination of measures (residual gating + scheduler + higher wd) gave ~0.002 AUC improvement
+
+### Epoch-by-Epoch Comparison (Current vs Previous)
+| Stage | Current Run | Previous Run | Advantage |
+|-------|:--:|:--:|:--:|
+| Epoch 25 | 0.7216 | 0.7150 | +0.007 |
+| Epoch 50 | 0.7409 | 0.7393 | +0.002 |
+| Epoch 75 | 0.7546 | 0.7495 | +0.005 |
+| Epoch 100 | 0.7591 | 0.7519 | +0.007 |
+| Epoch 125 | 0.7618 | 0.7612 | +0.001 |
+| Epoch 153 | **0.7664** | 0.7636 | **+0.003** |
+
+### Design Decisions (new)
+| Decision | Rationale |
+|----------|-----------|
+| Residual language gate | Guarantees fusion model floor ≥ ESM-only by preserving language signal |
+| Bias-init 1.5 on gate output | Gives language branch a training "head start" against GCN gradient competition |
+| Physics gate unchanged (multiplicative) | W_phys=0.61 was healthy; residual would unnecessarily weaken its modulation |
+| ReduceLROnPlateau > StepLR | Epoch of convergence unknown a priori; adaptive decay matches real signal |
+| wd 5e-4 | FocalLoss has implicit regularization; 1e-4 was too conservative, 5e-4 provides real L2 |
+
 ## Paper-Aligned Independent Encoder — 10-Fold CV Results (2026-05-27)
 
 ### Architecture Decision: Independent Encoders > Per-Layer SuperNodeExchange

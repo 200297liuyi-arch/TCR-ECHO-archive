@@ -29,16 +29,20 @@ def train_one(cfg, epochs, run_name_suffix=""):
     )
 
     # ── Data ────────────────────────────────────────────────────────
-    df_train = pd.read_csv(cfg['dataset']['train_csv'])
+    from sklearn.model_selection import train_test_split
+    df_full = pd.read_csv(cfg['dataset']['train_csv'])
     if cfg['dataset'].get('val_csv'):
-        df_val = pd.read_csv(cfg['dataset']['val_csv'])
+        df_train, df_val = df_full, pd.read_csv(cfg['dataset']['val_csv'])
         df_test = pd.read_csv(cfg['dataset']['test_csv'])
     else:
+        val_split = cfg['dataset'].get('val_split', 0.15)
+        df_train, df_val = train_test_split(
+            df_full,
+            test_size=val_split,
+            stratify=df_full[cfg['dataset']['columns']['label']],
+            random_state=42,
+        )
         df_test = pd.read_csv(cfg['dataset']['test_csv'])
-        train_peps = set(df_train[cfg['dataset']['columns']['peptide']].unique())
-        mask = df_test[cfg['dataset']['columns']['peptide']].isin(train_peps)
-        df_val = df_test[~mask]
-        df_test = df_test[mask]
 
     pos = (df_train['label'] == 1).sum()
     neg = (df_train['label'] == 0).sum()
@@ -119,6 +123,17 @@ def train_one(cfg, epochs, run_name_suffix=""):
         weight_decay=cfg['training']['weight_decay'],
     )
 
+    sched_cfg = cfg['training'].get('scheduler', {})
+    scheduler = None
+    if sched_cfg.get('name') == 'ReduceLROnPlateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=sched_cfg.get('mode', 'max'),
+            factor=sched_cfg.get('factor', 0.5),
+            patience=sched_cfg.get('patience', 10),
+            min_lr=sched_cfg.get('min_lr', 1e-6),
+        )
+
     if len(train_loader) == 0:
         raise RuntimeError(
             f"Train loader has 0 batches ({len(train_ds)} samples loaded "
@@ -149,7 +164,9 @@ def train_one(cfg, epochs, run_name_suffix=""):
         # ── train ───────────────────────────────────────────────────
         model.train()
         losses = []
-        for batch in train_loader:
+        running_logits, running_labels = [], []
+        n_batches = len(train_loader)
+        for bi, batch in enumerate(train_loader):
             optimizer.zero_grad()
             batch = [b.to(cfg.get('device', 'cpu'), non_blocking=True) if isinstance(b, torch.Tensor) else b
                      for b in batch]
@@ -171,6 +188,17 @@ def train_one(cfg, epochs, run_name_suffix=""):
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
+            running_logits.append(logits.detach().cpu())
+            running_labels.append(labels.detach().cpu())
+            if bi % 100 == 0:
+                from sklearn.metrics import roc_auc_score as _ra
+                all_l = torch.cat(running_logits).sigmoid().numpy()
+                all_y = torch.cat(running_labels).numpy()
+                try:
+                    train_auc = _ra(all_y, all_l)
+                except ValueError:
+                    train_auc = 0.5
+                print(f'  [train] batch {bi}/{n_batches} loss={loss.item():.4f} train_auc={train_auc:.4f}', flush=True)
         avg_loss = sum(losses) / max(len(losses), 1)
 
         # ── validation ──────────────────────────────────────────────
@@ -186,6 +214,13 @@ def train_one(cfg, epochs, run_name_suffix=""):
             **({'lambda_int': lambda_int_now} if lambda_int_now is not None else {}),
         })
 
+        # Step LR scheduler
+        lr_now = optimizer.param_groups[0]['lr']
+        if scheduler is not None:
+            scheduler.step(val_metrics['auc'])
+            lr_now = optimizer.param_groups[0]['lr']
+            run.log({'lr': lr_now, 'epoch': epoch})
+
         now = __import__('datetime').datetime.now().strftime('%H:%M:%S')
         metric_str = ' | '.join(f'{k}={v:.4f}' for k, v in val_metrics.items())
         import subprocess, os
@@ -195,7 +230,7 @@ def train_one(cfg, epochs, run_name_suffix=""):
             gpu = smi.stdout.strip().replace('\n', ' | ')
         except:
             gpu = 'N/A'
-        print(f'[{now}] Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | {metric_str} | PID={os.getpid()} | GPU: {gpu}',
+        print(f'[{now}] Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | {metric_str} | lr={lr_now:.2e} | PID={os.getpid()} | GPU: {gpu}',
               flush=True)
 
         if val_metrics['auc'] > best_auc:

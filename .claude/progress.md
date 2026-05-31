@@ -1,5 +1,60 @@
 # Progress Log
 
+## Session: 2026-05-28~29 — Phase 2 Joint Training v2 (Residual Gating + Scheduler)
+
+### Gate Collapse Root Cause Analysis
+- **Status:** complete
+- Loaded best checkpoint from Phase 2 v1 (AUC 0.7647)
+- Analyzed gate statistics on 30 validation batches (~1920 samples)
+- **W_tcr=0.14, W_pep=0.22, W_phys=0.61** — language gate collapsed, physics gate healthy
+- Concluded: model was replacing ESM features with GCN, not fusing
+
+### Architecture Fixes
+- **Status:** complete
+- `gcn_plugin.py`: gate_lang refactored from nn.Sequential to named layers
+- `gcn_plugin.py`: language gating changed to residual `feat * (1 + W)`
+- `gcn_plugin.py`: gate_lang_fc2.bias initialized to 1.5
+- `gcn_plugin.py`: physics gating unchanged (multiplicative, default init)
+- `configs/config_gcn.yaml`: weight_decay 1e-4 → 5e-4
+- `configs/config_gcn.yaml`: early_stopping patience 10 → 20
+- `configs/config_gcn.yaml`: added scheduler section (ReduceLROnPlateau)
+- `train.py`: added scheduler creation + step logic + LR logging
+
+### Phase 2 v2 Training (2026-05-28~29, ~26h, ongoing)
+- **Status:** training at epoch 155/200
+- Config: bs=64, lr=5e-5, wd=5e-4, patience=20, ReduceLROnPlateau(factor=0.5, patience=10)
+- GPU 1 (RTX 5090), ~9 min/epoch, 23.6 GB VRAM
+- **Best val AUC: 0.7664 (epoch 153)** — broke previous ceiling of 0.7647!
+- LR schedule: 5e-5 (ep1-93) → 2.5e-5 (ep94-124) → 1.25e-5 (ep125+)
+- Each LR reduction brought renewed AUC improvement
+
+### AUC Progression
+| Epoch | AUC | LR | Note |
+|-------|-----|----|------|
+| 1 | 0.6432 | 5e-5 | start |
+| 25 | 0.7216 | 5e-5 | leading prev run by +0.007 |
+| 63 | 0.7506 | 5e-5 | broke 0.75 |
+| 83 | 0.7585 | 5e-5 | peak at 5e-5 |
+| 94 | 0.7539 | **2.5e-5** | 1st LR reduction |
+| 107 | 0.7615 | 2.5e-5 | recovery |
+| 114 | 0.7628 | 2.5e-5 | peak at 2.5e-5 |
+| 125 | 0.7618 | **1.25e-5** | 2nd LR reduction |
+| 148 | 0.7638 | 1.25e-5 | grinding upward |
+| 151 | 0.7654 | 1.25e-5 | broke 0.765 |
+| **153** | **0.7664** | 1.25e-5 | **NEW CEILING** |
+| 155 | 0.7641 | 1.25e-5 | slight pullback |
+
+### Files changed (2026-05-28~29)
+| File | Action |
+|------|--------|
+| `gcn_plugin.py` | Residual gating + bias init for language gate |
+| `train.py` | +ReduceLROnPlateau scheduler + LR logging + train_auc progress |
+| `configs/config_gcn.yaml` | wd 5e-4, patience 20, scheduler, bs=64 |
+| `utils.py` | Fixed load_checkpoint GCNPlugin compatibility |
+| `.claude/task_plan.md` | Phase 11 added |
+| `.claude/findings.md` | Gate analysis + residual gating findings |
+| `.claude/progress.md` | This update |
+
 ## Session: 2026-05-25~27 — Paper-Aligned Independent Encoder Architecture
 
 ### Paper-Aligned Architecture Implementation

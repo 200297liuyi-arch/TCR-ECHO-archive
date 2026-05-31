@@ -125,7 +125,7 @@ training:
   lora_dropout: 0.0
   lora_r: 32
   lr: 0.00005
-  output_dir: runs/gcn_joint/
+  output_dir: runs/gcn_joint_bias/
   temperature: 0.05
   weight_decay: 0.0005
 

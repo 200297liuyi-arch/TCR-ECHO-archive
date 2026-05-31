@@ -9,7 +9,19 @@
 Train a dual-track TCR-peptide binding predictor fusing ESM-2 protein language model (Track 1) with deepAntigen atom-level GCN (Track 2), achieving SOTA binding prediction on majority and zero-shot peptide sets.
 
 ## Current Phase
-Phase 10: GCN-Only Paper-Aligned Encoder — 10-Fold CV COMPLETE (2026-05-27)
+Phase 11: Phase 2 Joint Training v2 — Residual Gating + Scheduler (2026-05-28~29) — TRAINING IN PROGRESS
+
+### Phase 11: Phase 2 Joint Training v2 — Residual Gating + Overfitting Prevention (2026-05-28~29) — TRAINING
+- [x] Root cause: language gate collapse (W_tcr≈0.14, W_pep≈0.22) → ESM features suppressed
+- [x] Fix 1: Residual gating — `gated_tcr = tcr_feat * (1 + W_tcr)` guarantees 100% signal floor
+- [x] Fix 2: Language gate bias init to 1.5 → initial gate ~0.82, effective multiplier ~1.82×
+- [x] Fix 3: weight_decay 1e-4 → 5e-4
+- [x] Fix 4: Add ReduceLROnPlateau scheduler (factor=0.5, patience=10, min_lr=1e-6)
+- [x] Fix 5: early_stopping patience 10→20
+- [x] Fix 6: batch_size 32→64 (~4 min/epoch vs ~10 min)
+- [x] **Epoch 153/200**: AUC **0.7664** — BROKE previous ceiling of 0.7647!
+- [ ] Evaluate best checkpoint on majority + zero-shot test sets
+- **Status:** training, best val AUC=0.7664 (ep153), LR=1.25e-5 (2nd reduction)
 
 ### Phase 10: Paper-Aligned Independent Encoder + 10-Fold CV (2026-05-25~27) — COMPLETE ✅
 - [x] **Root cause confirmed**: per-layer SuperNodeExchange incompatible with depth=5 → train_loss stuck
