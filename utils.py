@@ -1,7 +1,19 @@
 import os
+import random
+import numpy as np
 import torch
 import yaml
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def save_checkpoint(model, optimizer, cfg, best_metric, out_dir):
@@ -51,7 +63,6 @@ def load_checkpoint(ModelClass, checkpoint_dir, class_imbalance, device='cuda'):
     if issubclass(ModelClass, _GCNPlugin):
         model_params['gcn_args'] = cfg.get('gcn', None)
         model_params['gcn_freeze_encoder'] = cfg.get('gcn_freeze_encoder', True)
-        model_params['lambda_gcn_aux'] = cfg.get('lambda_gcn_aux', 1.0)
     model = ModelClass(**model_params).to(device)
     model.load_state_dict(chk['model_state'])
     model.eval()
@@ -69,13 +80,10 @@ def compute_metrics(model, loader, device='cpu', use_graph=False, return_preds=F
                      for b in batch]
             if use_graph:
                 (inp1, msk1, inp2, msk2, at1, at2, labels,
-                 tcr_graphs, pep_graphs, tcr_mols, pep_mols,
-                 tcr_a2r, pep_a2r) = batch
+                 tcr_graphs, pep_graphs, *_rest) = batch
                 logits, _ = model(
                     inp1, msk1, inp2, msk2, at1, at2, labels,
                     tcr_graphs=tcr_graphs, pep_graphs=pep_graphs,
-                    tcr_mols=tcr_mols, pep_mols=pep_mols,
-                    tcr_a2r=tcr_a2r, pep_a2r=pep_a2r,
                 )
             else:
                 *inputs, labels = batch

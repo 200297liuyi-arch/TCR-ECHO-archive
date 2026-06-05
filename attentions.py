@@ -57,8 +57,7 @@ class BidirectionalDualViewAttention(nn.Module):
 
     def _forward_one_direction(self, q_seq, kv_seq, atc_q, atc_kv,
                                 q_proj, k_proj, v_proj, out_proj,
-                                transpose_U=False,
-                                gcn_bias=None):
+                                transpose_U=False):
         """Single cross-attention direction.
 
         q_seq: query sequence embedding   [B, Lq, D]
@@ -83,10 +82,6 @@ class BidirectionalDualViewAttention(nn.Module):
         # View 1: sequence attention
         S_seq = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B,H,Lq,Lkv]
 
-        # Add GCN physical interaction bias (if provided)
-        if gcn_bias is not None:
-            S_seq = S_seq + gcn_bias
-
         # View 2: biophysical attention
         S_bio = torch.zeros_like(S_seq)
         U_eff = self.U.transpose(-1, -2) if transpose_U else self.U
@@ -110,7 +105,7 @@ class BidirectionalDualViewAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, Lq, self.dim)
         return out_proj(out)
 
-    def forward(self, tcr_enc, pep_enc, atchley1, atchley2, *, gcn_bias=None):
+    def forward(self, tcr_enc, pep_enc, atchley1, atchley2):
         """Bi-directional cross-attention.
 
         Parameters
@@ -132,17 +127,15 @@ class BidirectionalDualViewAttention(nn.Module):
             q_proj=self.q_proj_t, k_proj=self.k_proj_p, v_proj=self.v_proj_p,
             out_proj=self.out_proj_t,
             transpose_U=False,
-            gcn_bias=gcn_bias,
         )
 
-        # Direction 2: Peptide → TCR  (U^T for symmetric scoring, transpose bias)
+        # Direction 2: Peptide → TCR  (U^T for symmetric scoring)
         pep_att = self._forward_one_direction(
             q_seq=pep_enc, kv_seq=tcr_enc,
             atc_q=atchley2, atc_kv=atchley1,
             q_proj=self.q_proj_p, k_proj=self.k_proj_t, v_proj=self.v_proj_t,
             out_proj=self.out_proj_p,
             transpose_U=True,
-            gcn_bias=gcn_bias.transpose(-1, -2) if gcn_bias is not None else None,
         )
 
         return tcr_att, pep_att

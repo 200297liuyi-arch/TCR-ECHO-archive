@@ -12,7 +12,9 @@ dataset:
     tcr: seq_1
   test_csv: test.csv
   train_csv: train.csv
-  val_csv: val.csv
+  val_split: 0.15
+
+random_seed: 42
 esm:
   encoder1: esm2_t33_650M_UR50D
   encoder2: esm2_t33_650M_UR50D

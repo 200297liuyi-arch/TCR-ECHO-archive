@@ -392,7 +392,34 @@ class PaperTopKPooling(torch.nn.Module):
             x_top = torch.stack(x_parts)
         else:
             x_top = x_top.view(bz, self.ratio, -1)
-        return x_top, perm
+
+        # ── Per-molecule local indices + valid mask ─────────────────
+        num_nodes = scatter_add(batch.new_ones(batch.size(0)), batch, dim=0)
+        cum_atoms = torch.cat([num_nodes.new_zeros(1),
+                               num_nodes.cumsum(0)[:-1]], dim=0)  # [B]
+        perm_splits = torch.split(perm, k_per_mol.tolist())
+        valid_list, perm_local_list = [], []
+        ratio = self.ratio
+        for i in range(bz):
+            ki = k_per_mol[i].item()
+            need = ratio - ki
+            local_perm = perm_splits[i] - cum_atoms[i].item()
+            if need > 0:
+                perm_local_list.append(torch.cat([
+                    local_perm.long(),
+                    local_perm.new_zeros(need),
+                ]))
+                valid_list.append(torch.cat([
+                    torch.ones(ki, device=x.device),
+                    torch.zeros(need, device=x.device),
+                ]))
+            else:
+                perm_local_list.append(local_perm.long())
+                valid_list.append(torch.ones(ratio, device=x.device))
+        perm_local = torch.stack(perm_local_list)   # [B, k]
+        valid_mask = torch.stack(valid_list)         # [B, k]
+
+        return x_top, perm_local, valid_mask
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -425,8 +452,8 @@ class PaperEncoder(nn.Module):
             x_l = self.gcn[i](x_l, edge_index, edge_attr, ibatch)
             x_l = self.bn_x[i](x_l)
             if i == self.GCN_Depth - 1:
-                fs, perm = self.top_K_pooling[i](x_l, batch=ibatch)
-        return fs
+                fs, perm_local, valid_mask = self.top_K_pooling[i](x_l, batch=ibatch)
+        return {"features": fs, "perm_local": perm_local, "valid_mask": valid_mask}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -570,7 +597,7 @@ class MultiHeadAttention(nn.Module):
       'sum'  — returns sum(intermap * att, dim=(1,2)) [B, H] (paper-aligned)
     """
 
-    def __init__(self, hidden_size: int, n_heads: int, output_mode: str = 'full'):
+    def __init__(self, hidden_size: int, n_heads: int, output_mode: str = 'sum'):
         super().__init__()
         self.hidden_size = hidden_size
         self.n_heads = n_heads
@@ -883,9 +910,90 @@ class PaperAlignedDeepGCN(nn.Module):
         )
 
     def forward(self, peptide_graphs, cdr3_graphs):
-        peptide_fs = self.peptide_encoder(peptide_graphs)
-        cdr3_fs = self.cdr3_encoder(cdr3_graphs)
+        pep_out = self.peptide_encoder(peptide_graphs)
+        cdr_out = self.cdr3_encoder(cdr3_graphs)
+        peptide_fs = pep_out["features"]
+        cdr3_fs = cdr_out["features"]
         peptide_cdr3_intermap = self.peptide_cdr3_att(peptide_fs, cdr3_fs)
         proj = F.relu(self.dropout(self.projector(peptide_cdr3_intermap)))
         logits = self.classier(proj)
         return logits.squeeze(-1)
+
+
+# ============================================================================
+#  SeqAlignedGCN  — 完全对齐 deepAntigen_Seq 原文架构
+# ============================================================================
+
+class SeqAlignedGCN(nn.Module):
+    """完全对齐 deepAntigen_Seq (pTCR_seq.py) 的 GCN 编码器。
+
+    与原文三处完全对齐：
+      1. 跨模态交互仅在末层 MHA — 2 个独立 PaperEncoder，无 per-layer SuperNodeExchange
+      2. GRU 内嵌在 TGCN 消息传递后 (message→update→GRUCell)
+      3. depth=5，独立编码器无梯度坍塌问题
+
+    deepAntigen_Seq 原文架构:
+      peptide -> PaperEncoder(depth=5, k=20) -> [B, k, H]
+      cdr3    -> PaperEncoder(depth=5, k=20) -> [B, k, H]
+      MHA(full output) -> interaction_map [B, k, k, H]
+
+    返回 dict 接口与 DeepGCN 完全兼容，可直接替换 gcn_plugin.py 中的 DeepGCN。
+    """
+
+    def __init__(self, args: dict):
+        super().__init__()
+        HS = args['hidden_size']
+        depth = args['depth']
+        k = args['k']
+        heads = args.get('heads', 4)
+        in_channels = args.get('in_channels', 25)
+
+        self.peptide_encoder = PaperEncoder(in_channels, HS, depth, k)
+        self.cdr3_encoder = PaperEncoder(in_channels, HS, depth, k)
+        self.peptide_cdr3_att = MultiHeadAttention(HS, heads)
+        self.dropout_atom = nn.Dropout(p=0.2)
+
+    def forward(self, peptide_graphs, cdr3_graphs):
+        """独立编码 + 末层交叉注意力 (sum 模式)。
+
+        deepAntigen Seq 原文流程:
+          peptide → PaperEncoder → TopK → MHA(sum) → [B, H]
+          cdr3    → PaperEncoder → TopK ↗
+        """
+        pep_out = self.peptide_encoder(peptide_graphs)
+        cdr_out = self.cdr3_encoder(cdr3_graphs)
+        gcn_feat = self.peptide_cdr3_att(
+            pep_out["features"], cdr_out["features"])  # [B, H]
+        return {"gcn_feat": gcn_feat}
+
+    def freeze_encoder(self):
+        """冻结编码器 (init + TGCN + BN)，仅 TopK + 交叉注意力可训练。"""
+        for p in self.peptide_encoder.init_w.parameters():
+            p.requires_grad = False
+        for p in self.cdr3_encoder.init_w.parameters():
+            p.requires_grad = False
+        for gcn in self.peptide_encoder.gcn:
+            for p in gcn.parameters():
+                p.requires_grad = False
+        for gcn in self.cdr3_encoder.gcn:
+            for p in gcn.parameters():
+                p.requires_grad = False
+        for bn in self.peptide_encoder.bn_x:
+            for p in bn.parameters():
+                p.requires_grad = False
+        for bn in self.cdr3_encoder.bn_x:
+            for p in bn.parameters():
+                p.requires_grad = False
+        for p in self.peptide_encoder.top_K_pooling.parameters():
+            p.requires_grad = True
+        for p in self.cdr3_encoder.top_K_pooling.parameters():
+            p.requires_grad = True
+        for p in self.peptide_cdr3_att.parameters():
+            p.requires_grad = True
+
+    def freeze_topk(self):
+        """冻结全部参数。"""
+        for p in self.parameters():
+            p.requires_grad = False
+
+

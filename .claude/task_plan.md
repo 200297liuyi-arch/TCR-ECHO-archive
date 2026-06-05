@@ -9,9 +9,41 @@
 Train a dual-track TCR-peptide binding predictor fusing ESM-2 protein language model (Track 1) with deepAntigen atom-level GCN (Track 2), achieving SOTA binding prediction on majority and zero-shot peptide sets.
 
 ## Current Phase
-Phase 11: Phase 2 Joint Training v2 — Residual Gating + Scheduler (2026-05-28~29) — TRAINING IN PROGRESS
+Phase 13: SeqAlignedGCN — 完全对齐 deepAntigen_Seq 原文架构 (2026-06-04) — IMPLEMENTED
 
-### Phase 11: Phase 2 Joint Training v2 — Residual Gating + Overfitting Prevention (2026-05-28~29) — TRAINING
+### Phase 13: SeqAlignedGCN — 完全对齐 deepAntigen_Seq 原文 (2026-06-04) — COMPLETE ✅
+- [x] **Root cause discovery**: GCN attention bias has ZERO effect (τ=0.227 vs τ=0: prediction correlation=1.0000)
+- [x] **deepAntigen source analysis**: atom-level model uses PDB 3D structures for supervision — we only have 1-bit labels
+- [x] **deepAntigen_Seq vs TCR-ECHO DeepGCN comparison**:
+  - 跨模态交互：原文独立编码器仅末层 MHA，我们每层 SuperNodeExchange
+  - GRU 位置：原文 TGCN 内嵌 GRU，我们层末 GRU (LocalMP→SuperNode→GRU)
+  - 深度：原文 depth=5，我们 depth=2（≥3 梯度坍塌）
+- [x] `SeqAlignedGCN` 实现：2 个独立 PaperEncoder(depth=5, k=20) + 末层 MHA(full output)
+- [x] `PaperEncoder.forward()` 扩展为返回 dict（features + perm_local + valid_mask）
+- [x] `PaperTopKPooling.forward()` 返回局部索引和 valid_mask
+- [x] `gcn_plugin.py` 切换：`DeepGCN` → `SeqAlignedGCN`
+- [x] 配置更新：depth 2→5, k=20
+- [x] 参数量：1.64M (vs 旧 DeepGCN d=2: 1.05M)
+- **Status:** implemented, ready for training
+
+### Phase 12: GCN Bias Training — Reproducible (seed=42) + Diagnostic (2026-06-02~03) — COMPLETE ✅
+- [x] `set_seed()` added to `utils.py` (random + numpy + torch + cudnn)
+- [x] `train.py`, `gcn_only_train.py` call `set_seed()` on entry
+- [x] Val split always from train CSV (15% stratified by label, configurable `random_seed: 42`)
+- [x] **Training**: 195/200 epochs (early stop), val AUC **0.7646** (ep175)
+- [x] **Test**: AUC **0.8390**, Acc 0.7742, F1 **0.7562** (+2.95pp vs prev GCN Bias F1)
+- [x] **Zero-shot**: AUC 0.8050, F1 0.7075
+- [x] **τ ablation diagnostic** (2026-06-03):
+  - τ=0.227 vs τ=0: predictions 100% identical (correlation=1.0000, max|Δ|=3.5e-4)
+  - GCN bias path contributes NOTHING — model learned to ignore it
+  - 95.97% predictions changed by τ, but max change 0.035 percentage points
+- [x] **deepAntigen source analysis**:
+  - Atom-level (`pTCR_atom.py`): 2-stage fine-tuning with PDB distance matrix supervision
+  - Seq-level (`pTCR_seq.py`): `sum(dim=(1,2))` + FocalLoss, no 3D structures
+  - Both use identical TGCN backbone — difference is supervision, not architecture
+- **Status:** complete — GCN Bias confirmed dead path, root cause understood
+
+### Phase 11: Phase 2 Joint Training v2 — Residual Gating + Scheduler (2026-05-28~29) — COMPLETE ✅
 - [x] Root cause: language gate collapse (W_tcr≈0.14, W_pep≈0.22) → ESM features suppressed
 - [x] Fix 1: Residual gating — `gated_tcr = tcr_feat * (1 + W_tcr)` guarantees 100% signal floor
 - [x] Fix 2: Language gate bias init to 1.5 → initial gate ~0.82, effective multiplier ~1.82×
@@ -20,8 +52,8 @@ Phase 11: Phase 2 Joint Training v2 — Residual Gating + Scheduler (2026-05-28~
 - [x] Fix 5: early_stopping patience 10→20
 - [x] Fix 6: batch_size 32→64 (~4 min/epoch vs ~10 min)
 - [x] **Epoch 153/200**: AUC **0.7664** — BROKE previous ceiling of 0.7647!
-- [ ] Evaluate best checkpoint on majority + zero-shot test sets
-- **Status:** training, best val AUC=0.7664 (ep153), LR=1.25e-5 (2nd reduction)
+- [x] Evaluate best checkpoint on majority + zero-shot test sets
+- **Status:** complete
 
 ### Phase 10: Paper-Aligned Independent Encoder + 10-Fold CV (2026-05-25~27) — COMPLETE ✅
 - [x] **Root cause confirmed**: per-layer SuperNodeExchange incompatible with depth=5 → train_loss stuck
@@ -201,6 +233,10 @@ Phase 11: Phase 2 Joint Training v2 — Residual Gating + Scheduler (2026-05-28~
 | **Identity shortcut in GCN proj** | 256→256 Linear shortcut was redundant 65K params; identity preserves gradient perfectly |
 | **Cosine annealing λ_gcn_aux 1.0→0.1** | Fixed λ=1.0 over-emphasized aux task late in training; annealing lets focal loss dominate after cold start |
 | **Cosine annealing λ_int 2.0→0.5** | Fixed λ=2.0 dominated language feature space; decay gives classifier more signal later |
+| **set_seed(42) everywhere** | Prior runs had no random seed — results were not reproducible; seed now configurable via `random_seed` in YAML |
+| **Val always from train CSV (15% stratified)** | Eliminates pre-split val_csv inconsistency; guarantees val/test distribution gap is controlled |
+| **SeqAlignedGCN replacing DeepGCN** | Per-layer SuperNodeExchange limits depth to 2 and adds 164K params of cross-modal overhead; independent encoders enable depth=5 matching paper |
+| **Ablation: GCN bias path is dead** | τ=0 prediction = τ=0.227 prediction (correlation=1.0); 1-bit label can't supervise 128×100 atom-pair features — signal diluted 12,800× |
 
 ## Errors Encountered (cumulative)
 | # | Error | Attempt | Resolution |

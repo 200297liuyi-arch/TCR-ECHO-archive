@@ -1,4 +1,5 @@
-# ECHO-ESM: Pure ESM-2 language model baseline (no GCN)
+# ECHO-GCN V2: SeqAlignedGCN + lightweight gate + direct concat fusion
+# Aligned with deepAntigen Seq (Nature Communications 2025)
 device: cuda
 classifier_hidden: 512
 
@@ -19,6 +20,8 @@ dataset:
 
 random_seed: 42
 
+graph_cache_dir: datasets/echo/panpep/graph_cache
+
 esm:
   encoder1: esm2_t33_650M_UR50D
   encoder2: esm2_t33_650M_UR50D
@@ -32,8 +35,6 @@ evaluation:
     log: true
 
 use_lora: True
-use_gcn: false
-
 lora:
   presets:
     esm2_t33_650M_UR50D:
@@ -44,16 +45,41 @@ lora:
       r: 8
       task_type: FEATURE_EXTRACTION
 
+# ── GCN Track 2 (SeqAlignedGCN) ──────────────────────────────
+use_gcn: true
+
+gcn:
+  hidden_size: 128
+  depth: 5
+  k: 20
+  heads: 4
+  in_channels: 25
+
+gcn_freeze_encoder: false
+
+# ── Loss weight annealing (contrastive only) ──────────────────
+loss_annealing:
+  lambda_int:
+    start: 2.0
+    end: 0.5
+    schedule: cosine
+
 model:
-  checkpoint_dir: runs/esm_only/
+  checkpoint_dir: runs/gcn_joint_v2/
 
 training:
   second_contrastive: True
-  batch_size: 32
+  batch_size: 64
   dropout: 0.3
   cross_attn_dropout: 0.3
   early_stopping:
+    patience: 20
+  scheduler:
+    name: ReduceLROnPlateau
+    mode: max
+    factor: 0.5
     patience: 10
+    min_lr: 0.000001
   epochs: 200
   focal_gamma: 2.0
   lambda_int: 2.0
@@ -61,10 +87,10 @@ training:
   lora_dropout: 0.0
   lora_r: 32
   lr: 0.00005
-  output_dir: runs/esm_only/
+  output_dir: runs/gcn_joint_v2/
   temperature: 0.05
-  weight_decay: 0.0001
+  weight_decay: 0.0005
 
 wandb:
-  project: ECHO-ESM-Only
+  project: ECHO-GCN-V2
   run: run1

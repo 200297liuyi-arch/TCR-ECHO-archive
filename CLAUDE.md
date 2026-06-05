@@ -33,7 +33,28 @@ train.py           # Dynamic ModelClass selection by config
 - **ESM-only**: Linear(2560→512) + ReLU + Dropout(0.3) + Linear(512→1)
 - **ESM+GCN**: Linear(1280→512) + ReLU + Dropout(0.3) + Linear(512→1)
 
-## Current State (2026-05-21)
+## Current State (2026-06-04)
+
+### SeqAlignedGCN — 完全对齐 deepAntigen_Seq (NEW)
+- Replaced per-layer SuperNodeExchange DeepGCN with 2 independent PaperEncoders + final MHA
+- Three alignment points: independent encoders (no cross-modal during encoding), TGCN GRU placement, depth=5
+- `gcn_plugin.py` now uses `SeqAlignedGCN` (drop-in replacement)
+- Params: 1,641,472 (depth=5) vs old DeepGCN 1,053,184 (depth=2)
+- Config: `config_gcn.yaml`, `config_gcn_bias.yaml` (depth=5, k=20)
+- **Ready for training** — not yet trained
+
+### GCN Bias — Confirmed Dead Path (τ ablation)
+- τ=0.227 vs τ=0: predictions 100% identical (corr=1.0, max|Δ|=0.00035)
+- GCN attention bias contributes nothing — model learned to ignore it
+- Root cause: 1-bit label supervises 128dim×100 atom pairs → signal diluted 12,800×
+
+### Performance Summary (all models, unified test set)
+| Model | Val AUC | Test AUC | Test Acc | ZS AUC | ZS Acc | ZS F1 |
+|-------|:---:|:---:|:---:|:---:|:---:|:---:|
+| ESM-only | 0.7671 | 0.8371 | 0.7730 | **0.8148** | **0.7474** | **0.7149** |
+| GCN Joint v2 | 0.7664 | 0.8364 | 0.7717 | 0.8076 | — | 0.6975 |
+| GCN Bias (seed=42) | 0.7646 | **0.8390** | **0.7742** | 0.8050 | 0.7351 | 0.7075 |
+| **V2 (Sum+Gate)** | **0.7698** | 0.8382 | 0.7723 | 0.8092 | 0.7392 | 0.7125 |
 
 ### ESM-Only Baseline (FIXED)
 | Metric | Old (buggy) | New (fixed) | Δ |
@@ -116,3 +137,4 @@ nohup env TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 WANDB_MODE=offline \
 14. **Dropout alignment** (2026-05-20): 0.08→0.3
 15. **Early stopping** (2026-05-20): patience=10
 16. **Modular refactoring** (2026-05-21): Model base + GCNPlugin
+17. **F1 pos_label bug** (2026-06-05): GCN Bias zero-shot F1 recorded as 0.7562 but real value is 0.7075 — F1 was computed with pos_label=0 (negative class) instead of pos_label=1 (binding). V2 F1=0.7125 is actually higher than V1.

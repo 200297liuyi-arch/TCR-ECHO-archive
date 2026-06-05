@@ -1,5 +1,61 @@
 # Findings & Decisions
 
+## Phase 13: SeqAlignedGCN — Architecture Alignment (2026-06-04)
+
+### GCN Bias Dead Path Confirmed (2026-06-03)
+- τ=0.227 vs τ=0: predictions 100% identical (corr=1.0000, max|Δ|=3.5e-4)
+- 95.97% of predictions change, but max change = 0.035 percentage points
+- GCN attention bias contributes absolutely nothing to the model
+- Root cause: 1-bit label supervises 128-dim × 100 atom-pair interaction — signal diluted 12,800×
+
+### deepAntigen_Seq vs TCR-ECHO DeepGCN: Three Architecture Gaps (2026-06-04)
+| Component | deepAntigen_Seq (pTCR_seq.py) | TCR-ECHO DeepGCN (old) |
+|-----------|------------------------------|-------------------------|
+| Cross-modal interaction | Final MHA only (independent encoders) | Every layer via SuperNodeExchange |
+| GRU placement | Inside TGCN (message→update→GRUCell) | End of layer (LocalMP→SuperNode→GRU) |
+| Max depth | 5 (stable, no cross-talk during encoding) | 2 (≥3 causes gradient collapse) |
+| TopK scoring | 1 weight (128 params) | 3-layer MLP (74K params) |
+| MHA output | `sum(dim=(1,2))` → [B,H] | Full [B,k,k,H] interaction_map |
+
+### SeqAlignedGCN Design (2026-06-04)
+- 2 independent PaperEncoders (TGCN×5, BN, PaperTopKPooling@last)
+- MHA(full output) only at the end
+- 5% node dropout during training (paper's augmentation)
+- Returns same dict interface as DeepGCN → drop-in replacement
+- Params: 1,641,472 (d=5) vs old DeepGCN 1,053,184 (d=2)
+  - Same depth: SeqAlignedGCN d=2 = 739,840 — 30% smaller
+
+### Design Decisions (new)
+| Decision | Rationale |
+|----------|-----------|
+| Independent encoders (no per-layer cross-modal) | Aligns with deepAntigen_Seq; enables depth=5 without gradient collapse |
+| TGCN (GRU inside) instead of LocalMP+external GRU | deepAntigen_Seq places GRU immediately after message+update — matches paper |
+| PaperTopKPooling (1 weight) instead of 3-layer MLP for TopK | Paper uses simple scoring; 3-layer MLP was 74K params of overkill |
+| Keep output_mode='full' (not paper's sum) | TCR-ECHO fusion needs full interaction_map for GCN bias + F_spatial paths |
+| Return dict (matching DeepGCN interface) | Drop-in replacement — gcn_plugin.py changed 1 line |
+
+## Phase 12: GCN Bias Training — Reproducible (seed=42) (2026-06-02~03)
+
+### Training Results
+- 195/200 epochs (early stop) — best val AUC **0.7646** (ep175)
+- **Majority Test**: AUC **0.8390**, Acc **0.7742**, F1 **0.7562** (+2.95pp vs prev run)
+- **Zero-Shot**: AUC 0.8050, F1 0.7075
+- Three LR reductions: 5e-5 → 2.5e-5 (ep113) → 1.25e-5 → 6.25e-6 (ep188)
+- Higher test AUC but lower val AUC than previous no-seed run
+
+### Reproducibility Fixes
+- `set_seed(seed)` in utils.py: random, numpy, torch.manual_seed, cuda.manual_seed_all, cudnn.deterministic
+- Validation always from training data (15% stratified by label)
+- `random_seed: 42` in all config YAMLs
+- Prior runs had NO seed — results were not reproducible
+
+### Design Decisions (new)
+| Decision | Rationale |
+|----------|-----------|
+| set_seed before data split AND model init | Both split randomness and weight init must be controlled |
+| Val always from train CSV (stratified) | Pre-split val_csv caused inconsistency; 15% stratified guarantees label balance |
+| cudnn.deterministic=True | May slow training slightly but required for exact reproducibility |
+
 ## Phase 11: Residual Gating + Scheduler — Gate Collapse Root Cause & Fix (2026-05-28~29)
 
 ### Gate Collapse Discovery (2026-05-28)

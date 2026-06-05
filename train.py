@@ -1,5 +1,7 @@
 import os
 import math
+import random
+import numpy as np
 import yaml
 import torch
 import wandb
@@ -10,7 +12,7 @@ from transformers import AutoTokenizer
 from model import Model
 from gcn_plugin import GCNPlugin
 from dataset import TCRPeptideDataset, collate_graph_batch
-from utils import save_checkpoint, compute_metrics, load_atchley, load_checkpoint
+from utils import save_checkpoint, compute_metrics, load_atchley, load_checkpoint, set_seed
 
 
 def cosine_anneal(epoch, total_epochs, start_val, end_val):
@@ -30,19 +32,19 @@ def train_one(cfg, epochs, run_name_suffix=""):
 
     # ── Data ────────────────────────────────────────────────────────
     from sklearn.model_selection import train_test_split
+
+    random_seed = cfg.get('random_seed', 42)
+    set_seed(random_seed)
+
     df_full = pd.read_csv(cfg['dataset']['train_csv'])
-    if cfg['dataset'].get('val_csv'):
-        df_train, df_val = df_full, pd.read_csv(cfg['dataset']['val_csv'])
-        df_test = pd.read_csv(cfg['dataset']['test_csv'])
-    else:
-        val_split = cfg['dataset'].get('val_split', 0.15)
-        df_train, df_val = train_test_split(
-            df_full,
-            test_size=val_split,
-            stratify=df_full[cfg['dataset']['columns']['label']],
-            random_state=42,
-        )
-        df_test = pd.read_csv(cfg['dataset']['test_csv'])
+    val_split = cfg['dataset'].get('val_split', 0.15)
+    df_train, df_val = train_test_split(
+        df_full,
+        test_size=val_split,
+        stratify=df_full[cfg['dataset']['columns']['label']],
+        random_state=random_seed,
+    )
+    df_test = pd.read_csv(cfg['dataset']['test_csv'])
 
     pos = (df_train['label'] == 1).sum()
     neg = (df_train['label'] == 0).sum()
@@ -112,7 +114,6 @@ def train_one(cfg, epochs, run_name_suffix=""):
             **shared_params,
             'gcn_args':             gcn_args,
             'gcn_freeze_encoder':   cfg.get('gcn_freeze_encoder', True),
-            'lambda_gcn_aux':       cfg.get('lambda_gcn_aux', 1.0),
         }
         model = GCNPlugin(**model_params).to(cfg.get('device', 'cpu'))
     else:
@@ -145,7 +146,6 @@ def train_one(cfg, epochs, run_name_suffix=""):
 
     # ── Loss annealing config ─────────────────────────────────────
     anneal_cfg = cfg.get('loss_annealing', {})
-    gcn_aux_cfg = anneal_cfg.get('lambda_gcn_aux', {})
     lint_cfg = anneal_cfg.get('lambda_int', {})
 
     patience = cfg['training']['early_stopping']['patience']
@@ -153,10 +153,7 @@ def train_one(cfg, epochs, run_name_suffix=""):
     no_improve = 0
     for epoch in range(epochs):
         # ── Compute annealed loss weights ──────────────────────────
-        lambda_gcn_aux_now = lambda_int_now = None
-        if gcn_aux_cfg.get('schedule') == 'cosine':
-            lambda_gcn_aux_now = cosine_anneal(
-                epoch, epochs, gcn_aux_cfg['start'], gcn_aux_cfg['end'])
+        lambda_int_now = None
         if lint_cfg.get('schedule') == 'cosine':
             lambda_int_now = cosine_anneal(
                 epoch, epochs, lint_cfg['start'], lint_cfg['end'])
@@ -177,9 +174,6 @@ def train_one(cfg, epochs, run_name_suffix=""):
                 logits, loss = model(
                     inp1, msk1, inp2, msk2, at1, at2, labels,
                     tcr_graphs=tcr_graphs, pep_graphs=pep_graphs,
-                    tcr_mols=tcr_mols, pep_mols=pep_mols,
-                    tcr_a2r=tcr_a2r, pep_a2r=pep_a2r,
-                    lambda_gcn_aux_override=lambda_gcn_aux_now,
                     lambda_int_override=lambda_int_now,
                 )
             else:
@@ -210,7 +204,6 @@ def train_one(cfg, epochs, run_name_suffix=""):
             'train_loss': avg_loss,
             **{f'val_{k}': v for k, v in val_metrics.items()},
             'epoch': epoch,
-            **({'lambda_gcn_aux': lambda_gcn_aux_now} if lambda_gcn_aux_now is not None else {}),
             **({'lambda_int': lambda_int_now} if lambda_int_now is not None else {}),
         })
 

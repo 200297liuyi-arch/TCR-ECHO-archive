@@ -1,12 +1,10 @@
 """GCNPlugin — extends Model with Track 2 (Physics) atom-level GCN.
 
-Inherits ESM-2 language track from Model, adds:
-  - AtomDeepGCN encoder
-  - TopK all-atom pooling + MHA → interaction_map
-  - Masked spatial aggregation + residual MLP
-  - ESM projections (1280→512) + Cross-Modal Gated Fusion
-  - GCN auxiliary classifier
-  - Cosine-annealed loss weights
+TCR-ECHO V2: deepAntigen Seq-aligned architecture.
+  - SeqAlignedGCN (independent encoders + final-MHA sum)
+  - Lightweight ESM→GCN gate (sigmoid, one Linear)
+  - Direct concat fusion: [tcr, pep, gated_gcn] → classifier
+  - No attention bias, no aux head, no complex gating.
 """
 
 import torch
@@ -15,14 +13,14 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch
 
 from model import Model, focal_loss, flexible_peptide_contrastive
-from gcn_components import DeepGCN as AtomDeepGCN
+from gcn_components import SeqAlignedGCN
 
 
 class GCNPlugin(Model):
     """Dual-track model: ESM-2 (Track 1) + Atom-level GCN (Track 2).
 
     Inherits ESM encoders, DualViewAttn, and loss functions from Model.
-    Adds GCN encoder, projections, gates, and overrides forward().
+    Adds SeqAlignedGCN + lightweight gate + direct concat fusion.
     """
 
     def __init__(
@@ -49,9 +47,7 @@ class GCNPlugin(Model):
         # ── GCN-specific ────────────────────────────────────────────
         gcn_args: dict = None,
         gcn_freeze_encoder: bool = True,
-        lambda_gcn_aux: float = 1.0,
     ):
-        # ── Inherit ESM track from Model ───────────────────────────────
         super().__init__(
             esm1_name=esm1_name,
             esm2_name=esm2_name,
@@ -74,48 +70,24 @@ class GCNPlugin(Model):
             random_init=random_init,
         )
 
-        # ESM hidden_dim (set by Model.__init__)
         hidden_dim = getattr(
             self.esm1.config, 'hidden_size',
             getattr(self.esm1, 'embed_dim', None)
         )
 
-        # ── Track 2: Atom-level GCN encoder ───────────────────────────
+        # ── Track 2: SeqAlignedGCN (deepAntigen Seq architecture) ─────
         if gcn_args is None:
             gcn_args = dict(
-                hidden_size=128, depth=2, k=10, heads=4,
+                hidden_size=128, depth=5, k=20, heads=4,
                 in_channels=25,
             )
-        self.gcn = AtomDeepGCN(gcn_args)
+        self.gcn = SeqAlignedGCN(gcn_args)
         self.gcn_hidden = gcn_args["hidden_size"]
-        self.gcn_k = gcn_args["k"]
 
         if gcn_freeze_encoder:
             self.gcn.freeze_encoder()
 
-        # ── GCN spatial projection: 256→512→256 residual MLP ──────────
-        spatial_in = self.gcn_hidden * 2  # 256
-        spatial_mid = 512
-        self.gcn_spatial_proj = nn.ModuleDict({
-            "fc1": nn.Linear(spatial_in, spatial_mid),
-            "fc2": nn.Linear(spatial_mid, spatial_in),
-            "norm": nn.LayerNorm(spatial_in),
-        })
-        self.gcn_spatial_dropout = nn.Dropout(0.2)
-
-        # ── GCN attention bias: project interaction_map → attention logit space ──
-        self.gcn_bias_proj = nn.Linear(self.gcn_hidden, num_heads)  # 128 → 8
-        self.gcn_bias_temp = nn.Parameter(torch.tensor(0.1))
-
-        # ── GCN auxiliary classifier ──────────────────────────────────
-        self.gcn_aux_head = nn.Sequential(
-            nn.Linear(spatial_in, self.gcn_hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.gcn_hidden // 2, 1),
-        )
-
-        # ── ESM Projections: 1280→512 (for balanced fusion) ───────────
+        # ── ESM Projections: 1280 → 512 ──────────────────────────────
         proj_dim = 512
         self.tcr_proj = nn.Sequential(
             nn.Linear(hidden_dim, proj_dim),
@@ -126,111 +98,18 @@ class GCNPlugin(Model):
             nn.LayerNorm(proj_dim),
         )
 
-        # ── Cross-Modal Gating ────────────────────────────────────────
-        # Decoupled language gate (residual: feat * (1+gate), floor=100%)
-        lang_gate_in = proj_dim * 2  # 1024
-        lang_gate_mid = 256
-        self.gate_lang_fc1 = nn.Linear(lang_gate_in, lang_gate_mid)
-        self.gate_lang_fc2 = nn.Linear(lang_gate_mid, lang_gate_in)
-        self.gate_lang_drop = nn.Dropout(dropout)
-        # Bias init: start with gate ~0.82, so effective multiplier ~1.82
-        nn.init.constant_(self.gate_lang_fc2.bias, 1.5)
+        # ── Lightweight GCN gate: ESM context → per-dim GCN trust ────
+        self.gate_gcn = nn.Linear(proj_dim * 2, self.gcn_hidden)
+        nn.init.constant_(self.gate_gcn.bias, 0.0)  # sigmoid(0)=0.5 neutral start
 
-        # Cross-modal physics gate: language context → physics gate
-        self.ctx_lang_proj = nn.Sequential(
-            nn.Linear(proj_dim, 128),
-            nn.ReLU(),
-        )
-        phys_gate_in = self.gcn_hidden * 2 + 128  # 256 + 128 = 384
-        phys_gate_mid = 64
-        self.gate_phys = nn.Sequential(
-            nn.Linear(phys_gate_in, phys_gate_mid),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(phys_gate_mid, self.gcn_hidden * 2),
-        )
-
-        # ── Replace classifier: 1280-dim input (512+512+256) ─────────
-        fusion_dim = proj_dim + proj_dim + self.gcn_hidden * 2  # 512+512+256=1280
+        # ── Classifier: 512(tcr) + 512(pep) + 128(gcn) = 1152 ───────
+        fusion_dim = proj_dim + proj_dim + self.gcn_hidden
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, classifier_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(classifier_hidden, 1),
         )
-
-        # ── GCN loss weight ───────────────────────────────────────────
-        self.lambda_gcn_aux = lambda_gcn_aux
-
-    def _build_gcn_attn_bias(self, interaction_map, p_perm, c_perm,
-                              p_valid, c_valid, tcr_a2r, pep_a2r,
-                              L_tcr, L_pep):
-        """Build residue-level attention bias from GCN atom-level interaction.
-
-        interaction_map: [B, k, k, H]   atom-level cross-modal features (ghost-masked)
-        p_perm:         [B, k]         peptide selected atom local indices
-        c_perm:         [B, k]         TCR selected atom local indices
-        p_valid:        [B, k]         1=real peptide atom, 0=ghost
-        c_valid:        [B, k]         1=real TCR atom, 0=ghost
-        tcr_a2r:        list[Tensor]   per-sample atom→residue mapping
-        pep_a2r:        list[Tensor]
-        L_tcr:          int            max TCR residues in batch
-        L_pep:          int            max peptide residues in batch
-
-        Returns: [B, num_heads, L_tcr, L_pep]
-        """
-        B, K, _, H = interaction_map.shape
-        num_heads = self.gcn_bias_proj.out_features  # 8
-
-        # 1. Project: [B, k, k, H] → [B, k, k, 8]
-        feat = self.gcn_bias_proj(interaction_map)
-
-        # 2. Scale: / sqrt(H) × τ
-        feat = feat / (H ** 0.5) * self.gcn_bias_temp
-
-        # 3. Per-sample A2R scatter_max into residue-level
-        bias_list = []
-        for i in range(B):
-            tcr_map = tcr_a2r[i].to(feat.device)   # [n_tcr_atoms] → residue_idx per atom
-            pep_map = pep_a2r[i].to(feat.device)   # [n_pep_atoms]
-
-            tcr_res = tcr_map[c_perm[i].long()]   # [k] residue idx for selected atoms
-            pep_res = pep_map[p_perm[i].long()]   # [k]
-
-            pv = p_valid[i].bool()   # [k]
-            cv = c_valid[i].bool()   # [k]
-            pair_valid = cv[:, None] & pv[None, :]  # [k, k] valid atom pairs
-
-            feat_i = feat[i]  # [k, k, 8]
-            bias_i_flat = torch.full(
-                (L_tcr * L_pep, num_heads),
-                float('-inf'), device=feat.device, dtype=feat.dtype,
-            )
-
-            # Collect valid atom→residue indices and features
-            valid_mask = pair_valid & (tcr_res.unsqueeze(1) < L_tcr) & (pep_res.unsqueeze(0) < L_pep)
-            valid_idx = valid_mask.nonzero(as_tuple=False)  # [N_valid, 2]
-            if valid_idx.size(0) > 0:
-                a_tcr_idx = valid_idx[:, 0]
-                a_pep_idx = valid_idx[:, 1]
-                r_tcr_idx = tcr_res[a_tcr_idx]  # [N_valid]
-                r_pep_idx = pep_res[a_pep_idx]  # [N_valid]
-                flat_idx = r_tcr_idx * L_pep + r_pep_idx  # [N_valid]
-                flat_feat = feat_i[a_tcr_idx, a_pep_idx]  # [N_valid, 8]
-                bias_i_flat.scatter_reduce_(
-                    0,
-                    flat_idx.unsqueeze(-1).expand(-1, num_heads),
-                    flat_feat,
-                    reduce='amax',
-                    include_self=False,
-                )
-
-            # Replace -inf (no atom mapping) with 0.0
-            bias_i_flat = torch.nan_to_num(bias_i_flat, nan=0.0, neginf=0.0)
-            bias_i = bias_i_flat.view(L_tcr, L_pep, num_heads)
-            bias_list.append(bias_i.permute(2, 0, 1))  # [8, L_tcr, L_pep]
-
-        return torch.stack(bias_list)  # [B, 8, L_tcr, L_pep]
 
     def forward(
         self,
@@ -240,12 +119,8 @@ class GCNPlugin(Model):
         labels,
         tcr_graphs=None,
         pep_graphs=None,
-        tcr_mols=None,
-        pep_mols=None,
-        tcr_a2r=None,
-        pep_a2r=None,
-        lambda_gcn_aux_override=None,
         lambda_int_override=None,
+        **kwargs,
     ):
         # ══════════════════════════════════════════════════════════════
         #  Track 1 (Language): ESM encoding
@@ -269,58 +144,21 @@ class GCNPlugin(Model):
         )
 
         # ══════════════════════════════════════════════════════════════
-        #  Track 2 (Physics): Atom GCN → F_spatial
+        #  Track 2 (Physics): SeqAlignedGCN → gcn_feat [B, 128]
         # ══════════════════════════════════════════════════════════════
-        F_spatial = None
-        gcn_bias = None
+        F_gcn = None
 
         if tcr_graphs is not None:
             pep_batch = Batch.from_data_list(pep_graphs).to(tcr_enc.device)
             tcr_batch = Batch.from_data_list(tcr_graphs).to(tcr_enc.device)
-
-            gcn_out = self.gcn(pep_batch, tcr_batch, pep_mols, tcr_mols)
-
-            interaction_map = gcn_out["interaction_map"]  # [B, k, k, H_gcn]
-            joint_mask = gcn_out["joint_mask"]            # [B, k, k, 1]
-
-            # ── Build GCN attention bias ──────────────────────────────
-            gcn_bias = self._build_gcn_attn_bias(
-                interaction_map,
-                gcn_out["p_perm"], gcn_out["c_perm"],
-                gcn_out["p_valid"], gcn_out["c_valid"],
-                tcr_a2r, pep_a2r,
-                L_tcr=tcr_enc.size(1), L_pep=pep_enc.size(1),
-            )
-
-            B_gcn, K, _, H_gcn_local = interaction_map.shape
-            flat_map = interaction_map.view(B_gcn, K * K, H_gcn_local)
-            flat_mask = joint_mask.view(B_gcn, K * K, 1)
-
-            # Masked Max Pooling
-            max_map = flat_map.masked_fill(flat_mask == 0, -1e9)
-            max_feat, _ = max_map.max(dim=1)
-
-            # Masked Avg Pooling
-            sum_feat = (flat_map * flat_mask).sum(dim=1)
-            valid_count = flat_mask.sum(dim=1).clamp(min=1e-6)
-            avg_feat = sum_feat / valid_count
-
-            F_spatial_raw = torch.cat([max_feat, avg_feat], dim=-1)
-
-            # Residual MLP
-            x = F.relu(self.gcn_spatial_proj["fc1"](
-                self.gcn_spatial_dropout(F_spatial_raw)))
-            x = self.gcn_spatial_proj["fc2"](self.gcn_spatial_dropout(x))
-            F_spatial = self.gcn_spatial_proj["norm"](x + F_spatial_raw)
-
-            aux_logits = self.gcn_aux_head(F_spatial_raw).squeeze(-1)
+            gcn_out = self.gcn(pep_batch, tcr_batch)
+            F_gcn = gcn_out["gcn_feat"]  # [B, 128]
 
         # ══════════════════════════════════════════════════════════════
-        #  Track 1: Cross-Attention + Pooling
+        #  Track 1: Cross-Attention + Pooling (no GCN bias)
         # ══════════════════════════════════════════════════════════════
         tcr_att, pep_att = self.cross_attn(
             tcr_enc, pep_enc, atchley1, atchley2,
-            gcn_bias=gcn_bias,
         )
 
         tcr_pool = tcr_att.mean(dim=1)
@@ -336,41 +174,28 @@ class GCNPlugin(Model):
         pep_feat = self.pep_proj(pep_pool)
 
         # ══════════════════════════════════════════════════════════════
-        #  Cross-Modal Gated Fusion
+        #  Lightweight GCN gate + fusion
         # ══════════════════════════════════════════════════════════════
-        if F_spatial is not None:
-            # Decoupled language gating — residual: feat * (1 + sigmoid(gate))
-            h_lang = torch.cat([tcr_feat, pep_feat], dim=-1)
-            g = self.gate_lang_fc2(torch.relu(self.gate_lang_drop(self.gate_lang_fc1(h_lang))))
-            W_joint = torch.sigmoid(g)
-            W_tcr, W_pep = torch.split(W_joint, 512, dim=-1)
-
-            gated_tcr = tcr_feat * (1.0 + W_tcr)
-            gated_pep = pep_feat * (1.0 + W_pep)
-
-            # Cross-modal physics gating
-            ctx_lang = (tcr_feat + pep_feat) / 2
-            ctx_lang_small = self.ctx_lang_proj(ctx_lang)
-            phys_input = torch.cat([F_spatial, ctx_lang_small], dim=-1)
-            W_phys = torch.sigmoid(self.gate_phys(phys_input))
-            gated_phys = W_phys * F_spatial
-
-            fused = torch.cat([gated_tcr, gated_pep, gated_phys], dim=-1)
+        if F_gcn is not None:
+            gate = torch.sigmoid(
+                self.gate_gcn(torch.cat([tcr_feat, pep_feat], dim=-1))
+            )
+            gated_gcn = gate * F_gcn
+            fused = torch.cat([tcr_feat, pep_feat, gated_gcn], dim=-1)
         else:
-            phys_placeholder = torch.zeros(
-                tcr_feat.size(0), self.gcn_hidden * 2,
+            gcn_placeholder = torch.zeros(
+                tcr_feat.size(0), self.gcn_hidden,
                 device=tcr_feat.device, dtype=tcr_feat.dtype,
             )
-            fused = torch.cat([tcr_feat, pep_feat, phys_placeholder], dim=-1)
+            fused = torch.cat([tcr_feat, pep_feat, gcn_placeholder], dim=-1)
 
         logits = self.classifier(self.dropout(fused)).squeeze(-1)
 
         # ══════════════════════════════════════════════════════════════
-        #  Loss
+        #  Loss (focal + contrastive, no aux)
         # ══════════════════════════════════════════════════════════════
         if labels is not None:
             _lambda_int = lambda_int_override if lambda_int_override is not None else self.lambda_int
-            _lambda_gcn_aux = lambda_gcn_aux_override if lambda_gcn_aux_override is not None else self.lambda_gcn_aux
 
             loss_focal = focal_loss(
                 logits, labels,
@@ -385,14 +210,6 @@ class GCNPlugin(Model):
                 )
             else:
                 total_loss = loss_focal + self.lambda_enc * loss_enc
-
-            if F_spatial is not None:
-                gcn_aux_loss = focal_loss(
-                    aux_logits, labels,
-                    gamma=self.focal_gamma,
-                    alpha=self.class_balance,
-                )
-                total_loss = total_loss + _lambda_gcn_aux * gcn_aux_loss
 
             return logits, total_loss
         return logits

@@ -17,6 +17,8 @@ dataset:
   train_csv: datasets/echo/Panpep_trainingData.csv
   val_split: 0.15
 
+random_seed: 42
+
 graph_cache_dir: datasets/echo/panpep/graph_cache     # precomputed pickle cache
 
 esm:
@@ -78,7 +80,7 @@ fusion_gcn: true
 
 gcn:
   hidden_size: 128
-  depth: 2
+  depth: 5
   k: 20
   heads: 4
   in_channels: 25

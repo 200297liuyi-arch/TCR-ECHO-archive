@@ -1,5 +1,125 @@
 # Progress Log
 
+## Session: 2026-06-04 — SeqAlignedGCN: 完全对齐 deepAntigen_Seq 原文
+
+### Architecture Alignment
+- **Status:** complete
+- **Concept:** Replace per-layer cross-modal DeepGCN with 2 independent PaperEncoders + final MHA only
+- **Three alignment points with deepAntigen_Seq (pTCR_seq.py):**
+  1. 跨模态交互仅末层 MHA — 独立编码器，无 per-layer SuperNodeExchange
+  2. GRU 内嵌在 TGCN 内 (message→update→GRUCell)，非层末独立 GRU
+  3. depth=5 — 独立编码器无梯度坍塌，支持原文深度
+- **Spec:** design approved via brainstorming conversation
+
+### Files changed
+| File | Action |
+|------|--------|
+| `gcn_components.py` | +`SeqAlignedGCN` class, `PaperEncoder.forward()`→dict, `PaperTopKPooling`→local indices+valid_mask |
+| `gcn_plugin.py` | `DeepGCN` → `SeqAlignedGCN` (1 line) |
+| `configs/config_gcn.yaml` | depth 2→5 |
+| `configs/config_gcn_bias.yaml` | depth 2→5 |
+| `.claude/task_plan.md` | Phase 12 (GCN Bias training), Phase 13 (SeqAlignedGCN) added |
+| `.claude/findings.md` | Updated |
+| `.claude/progress.md` | This update |
+
+### Parameter comparison
+| Model | Depth | Params |
+|-------|:-----:|:------|
+| DeepGCN (old) | 2 | 1,053,184 |
+| SeqAlignedGCN | 5 | 1,641,472 |
+| SeqAlignedGCN | 2 | 739,840 |
+
+Key savings: PaperTopKPooling (128 params vs 74K 3-layer MLP), no SuperNodeExchange (saves 164K/d=2). Increase from d=2→d=5: 10 GRUCells (~99K each).
+
+## Session: 2026-06-02~03 — GCN Bias Training (seed=42) + Diagnostic
+
+### Reproducibility Fixes
+- **Status:** complete
+- `set_seed()` added to `utils.py` (random + numpy + torch + cudnn)
+- `train.py`, `gcn_only_train.py` call `set_seed()` on entry
+- Val split always from train CSV (15% stratified), configurable `random_seed: 42`
+- Removed `val_csv` branch — no more pre-split validation files
+
+### GCN Bias Training Results (2026-06-02~03, clean run, ~28h)
+- Config: bs=64, lr=5e-5, wd=5e-4, patience=20, depth=2, k=20
+- **195/200 epochs (early stop)** — best val AUC **0.7646** (ep175)
+- LR: 5e-5 (ep1-112) → 2.5e-5 (ep113-187) → 1.25e-5 (ep188+) → 6.25e-6 (ep188+)
+- **Majority Test**: AUC **0.8390**, Acc **0.7742**, F1 **0.7562**
+- **Zero-Shot**: AUC 0.8050, F1 0.7075
+
+### Performance Summary (all models, updated)
+| Model | Val AUC | Majority Test AUC | Zero-Shot AUC | Zero-Shot F1 |
+|-------|:---:|:---:|:---:|:---:|
+| ESM-only | 0.7671 | 0.8371 | **0.8148** | 0.7149 |
+| GCN Bias (prev, no seed) | **0.7699** | 0.8370 | 0.8085 | **0.7267** |
+| **GCN Bias (seed=42)** | **0.7646** | **0.8390** | **0.8050** | **0.7562** |
+
+### GCN Bias τ Ablation (2026-06-03)
+- **Status:** complete — definitive result
+- τ=0.227 vs τ=0: predictions 100% identical (correlation=1.0000)
+- 95.97% predictions changed by τ, but max |Δ|=0.000353 (0.035pp)
+- **GCN bias contributes NOTHING** — model learned to ignore it
+- Root cause: 1-bit binding label trying to supervise 128×100 atom-pair features — signal diluted 12,800×
+
+### Files changed (2026-06-02~03)
+| File | Action |
+|------|--------|
+| `utils.py` | +`set_seed()` function |
+| `train.py` | call set_seed, val_csv→always stratified split from train |
+| `gcn_only_train.py` | +`--seed` arg, fix non-fold split to stratified |
+| `configs/config_gcn.yaml` | +`random_seed: 42` |
+| `configs/config_gcn_bias.yaml` | +`random_seed: 42` |
+| `configs/config_esm_only.yaml` | `val_csv`→`val_split: 0.15`, +`random_seed: 42`, train_csv→full |
+| `configs/config.yaml` | `val_csv`→`val_split: 0.15`, +`random_seed: 42` |
+| `.claude/task_plan.md` | Phase 12 added |
+| `.claude/progress.md` | This update |
+| `.claude/findings.md` | τ ablation + deepAntigen source analysis |
+
+## Session: 2026-05-29~31 — GCN Interaction Attention Bias
+
+### Design & Implementation
+- **Status:** complete
+- **Concept:** Insert GCN atom-level interaction_map [B,k,k,128] as additive bias into BidirectionalDualViewAttention's S_seq logits before softmax
+- **Data flow:** interaction_map → Linear(128→8) → /√128 × τ → A2R scatter_max → [B,8,L_tcr,L_pep] → S_seq += bias
+- **Key design decisions:**
+  - Project first, scatter later (scatter on 8 channels is 16× cheaper than 128)
+  - scatter_max (preserves sharp contact peaks; mean dilutes them)
+  - Numerical normalization: `/√128 × τ` with τ init=0.1 (not LayerNorm: sparse matrix would inflate zeros; not tanh: saturation risk)
+  - Ghost atoms: `p_valid`/`c_valid` masks guide scatter, `include_self=False` + `nan_to_num` for autograd compatibility
+  - Direction 2 (Pep→TCR): bias.transpose(-1,-2) for correct orientation
+- **Spec:** `docs/superpowers/specs/2026-05-29-gcn-interaction-attention-bias-design.md`
+- **Plan:** `docs/superpowers/plans/2026-05-29-gcn-interaction-attention-bias-plan.md`
+
+### Files changed
+| File | Action |
+|------|--------|
+| `gcn_plugin.py` | +`gcn_bias_proj` Linear(128→8), +`gcn_bias_temp` τ=0.1, +`_build_gcn_attn_bias()` method |
+| `gcn_plugin.py` | `forward()`: build bias after GCN, pass to cross_attn |
+| `attentions.py` | `_forward_one_direction`: gcn_bias added to S_seq before softmax |
+| `attentions.py` | `forward()`: accepts `*, gcn_bias=None`, passes to both directions |
+| `configs/config_gcn.yaml` | k: 10 → 20 |
+| `configs/config_gcn_bias.yaml` | Created (same as gcn but output_dir=runs/gcn_joint_bias/) |
+
+### GCN Bias Training (2026-05-30~31, clean run, ~22h)
+- **Status:** complete — early stop @ epoch 143/200
+- Config: bs=64, lr=5e-5, wd=5e-4, patience=20, k=20
+- GPU 1 (RTX 5090), ~9 min/epoch
+- **Best val AUC: 0.7699 (epoch 123)** — new record (+0.35pp vs v2)
+- LR schedule: 5e-5 (ep1-133) → 2.5e-5 (ep134+)
+- **τ progression: 0.1 → peak 0.3025** — model tripled trust in GCN bias
+- Note: first attempt had two processes competing on same GPU (log corrupted); clean run above
+
+### Performance Summary
+| Model | Val AUC | Majority Test AUC | Zero-Shot AUC | Zero-Shot F1 |
+|-------|:---:|:---:|:---:|:---:|
+| ESM-only | 0.7671 | 0.8371 | **0.8148** | 0.7149 |
+| GCN Joint v2 | 0.7664 | 0.8364 | 0.8076 | 0.6975 |
+| **GCN Bias (clean)** | **0.7699** | **0.8370** | **0.8085** | **0.7267** |
+
+- GCN Bias improves val AUC +0.35pp and zero-shot F1 +2.92pp vs v2
+- Zero-shot AUC still -0.63pp below ESM-only, but gap narrowing
+- τ=0.3025 confirms model learns to trust physical bias; cold-start strategy works
+
 ## Session: 2026-05-28~29 — Phase 2 Joint Training v2 (Residual Gating + Scheduler)
 
 ### Gate Collapse Root Cause Analysis

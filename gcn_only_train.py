@@ -11,7 +11,7 @@ Changes from v1 (crashed depth=2 script):
   - Added gradient clipping, NaN detection, LR step schedule
   - Training log saved to runs/gcn_only/training.log
 """
-import os, sys, logging, time, argparse
+import os, sys, logging, time, argparse, random
 import numpy as np
 import pandas as pd
 import torch
@@ -20,10 +20,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 sys.path.insert(0, os.path.dirname(__file__))
 from gcn_components import DeepGCN
+from utils import set_seed
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 GRAPH_CACHE = 'datasets/echo/panpep/graph_cache'
@@ -132,11 +133,14 @@ def main():
     parser.add_argument('--n-folds', type=int, default=10, help='Number of CV folds')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     args = parser.parse_args()
 
     # GPU assignment
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    set_seed(args.seed)
 
     # Per-fold output directory
     if args.fold is not None:
@@ -172,10 +176,9 @@ def main():
     if df_test.columns[0].startswith('﻿'):
         df_test.columns = [c.lstrip('﻿') for c in df_test.columns]
 
-    # Train/val split
+    # Train/val split (stratified, configurable seed)
     if args.fold is not None:
-        # K-fold CV: train = all folds except args.fold, val = fold args.fold
-        skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=42)
+        skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
         labels = df_all['label'].values
         fold_indices = list(skf.split(np.zeros(len(df_all)), labels))
         train_idx, val_idx = fold_indices[args.fold]
@@ -183,9 +186,11 @@ def main():
         df_val = df_all.iloc[val_idx].reset_index(drop=True)
         logger.info(f'Fold {args.fold+1}/{args.n_folds}: {len(df_train)} train, {len(df_val)} val')
     else:
-        df_all = df_all.sample(frac=1, random_state=42).reset_index(drop=True)
-        split = int(len(df_all) * (1 - VAL_SPLIT))
-        df_train, df_val = df_all.iloc[:split], df_all.iloc[split:]
+        df_train, df_val = train_test_split(
+            df_all, test_size=VAL_SPLIT,
+            stratify=df_all['label'],
+            random_state=args.seed,
+        )
 
     logger.info(f'Train pos/neg: {df_train.label.sum():.0f}/{len(df_train)-df_train.label.sum():.0f}')
     logger.info(f'Test  pos/neg: {df_test.label.sum():.0f}/{len(df_test)-df_test.label.sum():.0f}')
