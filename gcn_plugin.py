@@ -1,10 +1,10 @@
 """GCNPlugin — extends Model with Track 2 (Physics) atom-level GCN.
 
-TCR-ECHO V2: deepAntigen Seq-aligned architecture.
+TCR-ECHO V3: remove ESM projection bottleneck.
+  - Raw ESM features (2560-dim, no projection) — preserves zero-shot info
   - SeqAlignedGCN (independent encoders + final-MHA sum)
-  - Lightweight ESM→GCN gate (sigmoid, one Linear)
-  - Direct concat fusion: [tcr, pep, gated_gcn] → classifier
-  - No attention bias, no aux head, no complex gating.
+  - Scalar GCN gate (learnable α, stateless) — avoids distribution-shift coupling
+  - Direct concat fusion: [tcr_raw, pep_raw, α·gcn] → classifier
 """
 
 import torch
@@ -19,8 +19,7 @@ from gcn_components import SeqAlignedGCN
 class GCNPlugin(Model):
     """Dual-track model: ESM-2 (Track 1) + Atom-level GCN (Track 2).
 
-    Inherits ESM encoders, DualViewAttn, and loss functions from Model.
-    Adds SeqAlignedGCN + lightweight gate + direct concat fusion.
+    V3: raw ESM (no projection) + scalar gate (no ESM→gate coupling).
     """
 
     def __init__(
@@ -87,23 +86,11 @@ class GCNPlugin(Model):
         if gcn_freeze_encoder:
             self.gcn.freeze_encoder()
 
-        # ── ESM Projections: 1280 → 512 ──────────────────────────────
-        proj_dim = 512
-        self.tcr_proj = nn.Sequential(
-            nn.Linear(hidden_dim, proj_dim),
-            nn.LayerNorm(proj_dim),
-        )
-        self.pep_proj = nn.Sequential(
-            nn.Linear(hidden_dim, proj_dim),
-            nn.LayerNorm(proj_dim),
-        )
+        # ── Scalar GCN gate: learnable α, stateless — no ESM coupling ──
+        self.gcn_alpha = nn.Parameter(torch.tensor(0.0))
 
-        # ── Lightweight GCN gate: ESM context → per-dim GCN trust ────
-        self.gate_gcn = nn.Linear(proj_dim * 2, self.gcn_hidden)
-        nn.init.constant_(self.gate_gcn.bias, 0.0)  # sigmoid(0)=0.5 neutral start
-
-        # ── Classifier: 512(tcr) + 512(pep) + 128(gcn) = 1152 ───────
-        fusion_dim = proj_dim + proj_dim + self.gcn_hidden
+        # ── Classifier: 1280(tcr) + 1280(pep) + 128(gcn) = 2688 ─────
+        fusion_dim = hidden_dim * 2 + self.gcn_hidden
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, classifier_hidden),
             nn.ReLU(),
@@ -155,44 +142,38 @@ class GCNPlugin(Model):
             F_gcn = gcn_out["gcn_feat"]  # [B, 128]
 
         # ══════════════════════════════════════════════════════════════
-        #  Track 1: Cross-Attention + Pooling (no GCN bias)
+        #  Track 1: Cross-Attention + Pooling
         # ══════════════════════════════════════════════════════════════
         tcr_att, pep_att = self.cross_attn(
             tcr_enc, pep_enc, atchley1, atchley2,
         )
 
-        tcr_pool = tcr_att.mean(dim=1)
-        pep_pool = pep_att.mean(dim=1)
+        tcr_pool = tcr_att.mean(dim=1)   # [B, 1280]
+        pep_pool = pep_att.mean(dim=1)   # [B, 1280]
 
         if self.second_contrastive:
             loss_int = flexible_peptide_contrastive(
                 pep_pool, tcr_pool, labels, temp=self.contrastive_temp
             )
 
-        # ── ESM projection: 1280 → 512 ────────────────────────────────
-        tcr_feat = self.tcr_proj(tcr_pool)
-        pep_feat = self.pep_proj(pep_pool)
-
         # ══════════════════════════════════════════════════════════════
-        #  Lightweight GCN gate + fusion
+        #  Scalar GCN gate + fusion (raw ESM, no projection)
         # ══════════════════════════════════════════════════════════════
         if F_gcn is not None:
-            gate = torch.sigmoid(
-                self.gate_gcn(torch.cat([tcr_feat, pep_feat], dim=-1))
-            )
+            gate = torch.sigmoid(self.gcn_alpha)
             gated_gcn = gate * F_gcn
-            fused = torch.cat([tcr_feat, pep_feat, gated_gcn], dim=-1)
+            fused = torch.cat([tcr_pool, pep_pool, gated_gcn], dim=-1)
         else:
             gcn_placeholder = torch.zeros(
-                tcr_feat.size(0), self.gcn_hidden,
-                device=tcr_feat.device, dtype=tcr_feat.dtype,
+                tcr_pool.size(0), self.gcn_hidden,
+                device=tcr_pool.device, dtype=tcr_pool.dtype,
             )
-            fused = torch.cat([tcr_feat, pep_feat, gcn_placeholder], dim=-1)
+            fused = torch.cat([tcr_pool, pep_pool, gcn_placeholder], dim=-1)
 
         logits = self.classifier(self.dropout(fused)).squeeze(-1)
 
         # ══════════════════════════════════════════════════════════════
-        #  Loss (focal + contrastive, no aux)
+        #  Loss (focal + contrastive)
         # ══════════════════════════════════════════════════════════════
         if labels is not None:
             _lambda_int = lambda_int_override if lambda_int_override is not None else self.lambda_int

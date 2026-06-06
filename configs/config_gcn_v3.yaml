@@ -1,0 +1,97 @@
+# ECHO-GCN V3: V2 + remove ESM projection bottleneck
+# Raw 2560-dim ESM (no 1280→512) + scalar GCN gate (no ESM coupling)
+# Target: fix zero-shot regression vs ESM-only
+device: cuda
+classifier_hidden: 512
+
+contrastive:
+  lambda_enc: 0.5
+  lambda_int: 2.0
+  temperature: 0.1
+
+dataset:
+  mask_prob: 0.1
+  columns:
+    label: label
+    peptide: peptide
+    tcr: binding_TCR
+  test_csv: datasets/echo/panpep/majority_testing_dataset.csv
+  train_csv: datasets/echo/Panpep_trainingData.csv
+  val_split: 0.15
+
+random_seed: 42
+
+graph_cache_dir: datasets/echo/panpep/graph_cache
+
+esm:
+  encoder1: esm2_t33_650M_UR50D
+  encoder2: esm2_t33_650M_UR50D
+
+evaluation:
+  batch_size: 32
+  metrics:
+  - auc
+  - accuracy
+  wandb:
+    log: true
+
+use_lora: True
+lora:
+  presets:
+    esm2_t33_650M_UR50D:
+      alpha: 32
+      bias: none
+      dropout: 0.1
+      layers_to_transform: [32, 31, 30, 29, 28]
+      r: 8
+      task_type: FEATURE_EXTRACTION
+
+# ── GCN Track 2 (SeqAlignedGCN) ──────────────────────────────
+use_gcn: true
+
+gcn:
+  hidden_size: 128
+  depth: 5
+  k: 20
+  heads: 4
+  in_channels: 25
+
+gcn_freeze_encoder: false
+
+# ── Loss weight annealing (contrastive only) ──────────────────
+loss_annealing:
+  lambda_int:
+    start: 2.0
+    end: 0.5
+    schedule: cosine
+
+model:
+  checkpoint_dir: runs/gcn_joint_v3/
+
+training:
+  second_contrastive: True
+  batch_size: 64
+  dropout: 0.3
+  cross_attn_dropout: 0.3
+  early_stopping:
+    patience: 20
+  scheduler:
+    name: ReduceLROnPlateau
+    mode: max
+    factor: 0.5
+    patience: 10
+    min_lr: 0.000001
+  epochs: 200
+  focal_gamma: 2.0
+  lambda_int: 2.0
+  lora_alpha: 32
+  lora_dropout: 0.0
+  lora_r: 32
+  lr: 0.00005
+  output_dir: runs/gcn_joint_v3/
+  temperature: 0.05
+  weight_decay: 0.0005
+
+wandb:
+  project: ECHO-GCN-V3
+  run: run1
